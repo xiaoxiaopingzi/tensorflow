@@ -1758,6 +1758,30 @@ func @identity_broadcast_in_dim_reshape(%arg0: tensor<128xf32>) -> tensor<128xf3
   // CHECK: return %arg0 : tensor<128xf32>
 }
 
+// CHECK-LABEL: @eliminate_identity_convert
+func @eliminate_identity_convert(%arg : tensor<?x32xi16>) -> tensor<?x32xi16> {
+  // CHECK-NOT: mhlo.convert
+  %0 = "mhlo.convert"(%arg) : (tensor<?x32xi16>) -> tensor<?x32xi16>
+  // CHECK: return %arg0 : tensor<?x32xi16>
+  return %0 : tensor<?x32xi16>
+}
+
+// CHECK-LABEL: @eliminate_redundant_reshape
+func @eliminate_redundant_reshape(%arg : tensor<1x32xi16>) -> tensor<1x32xi16> {
+  %0 = "mhlo.reshape"(%arg) : (tensor<1x32xi16>) -> tensor<2x16xi16>
+  %1 = "mhlo.reshape"(%0) : (tensor<2x16xi16>) -> tensor<1x32xi16>
+  // CHECK: return %arg0 : tensor<1x32xi16>
+  return %1 : tensor<1x32xi16>
+}
+
+// CHECK-LABEL: @eliminate_identity_reshape
+func @eliminate_identity_reshape(%arg : tensor<1x32xi16>) -> tensor<1x32xi16> {
+  // CHECK-NOT: mhlo.reshape
+  %0 = "mhlo.reshape"(%arg) : (tensor<1x32xi16>) -> tensor<1x32xi16>
+  // CHECK: return %arg0 : tensor<1x32xi16>
+  return %0 : tensor<1x32xi16>
+}
+
 // CHECK-LABEL: @broadcast_of_reshape
 func @broadcast_of_reshape(%arg: tensor<?xf32>,
                            %shape: tensor<2xindex>) -> tensor<?x?xf32> {
@@ -1808,4 +1832,25 @@ func @map_op_fold(%arg: tensor<?xf32>, %arg1: tensor<?xf32>) -> tensor<?xf32> {
 }
 // CHECK: return %arg1 : tensor<?xf32>
 
-
+func @sort_drop_second_arg(%arg0: tensor<3xi32>, %arg1: tensor<3xi32>) -> tensor<3xi32> {
+  %0:2 = "mhlo.sort"(%arg0, %arg1) ( {
+  ^bb0(%arg2: tensor<i32>, %arg3: tensor<i32>, %arg4: tensor<i32>, %arg5: tensor<i32>):  // no predecessors
+    %1 = "mhlo.compare"(%arg2, %arg3) {
+      comparison_direction = "GT"
+    } : (tensor<i32>, tensor<i32>) -> tensor<i1>
+    "mhlo.return"(%1) : (tensor<i1>) -> ()
+  }) {dimension = 0 : i64,
+      is_stable = false
+  } : (tensor<3xi32>, tensor<3xi32>) -> (tensor<3xi32>, tensor<3xi32>)
+  return %0#0 : tensor<3xi32>
+}
+// CHECK-LABEL: @sort_drop_second_arg
+// CHECK-SAME:    %[[ARG0:[a-zA-Z0-9_]+]]
+// CHECK-SAME:    %[[ARG1:[a-zA-Z0-9_]+]]
+// CHECK:         %[[RES:.+]] = "mhlo.sort"(%[[ARG0]])
+// CHECK:         ^bb0(%[[ARG2:.+]]: tensor<i32>, %[[ARG3:.+]]: tensor<i32>)
+// CHECK:           %[[CMP:.+]] = "mhlo.compare"(%[[ARG2]], %[[ARG3]])
+// CHECK-SAME:        {comparison_direction = "GT"} : (tensor<i32>, tensor<i32>) -> tensor<i1>
+// CHECK:           "mhlo.return"(%[[CMP]]) : (tensor<i1>) -> ()
+// CHECK:         {dimension = 0 : i64, is_stable = false} : (tensor<3xi32>) -> tensor<3xi32>
+// CHECK:         return %[[RES]] : tensor<3xi32>
