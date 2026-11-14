@@ -28,8 +28,8 @@ namespace tensorflow {
 namespace grappler {
 namespace {
 
-Status OptimizeWithMapParallelization(const GrapplerItem& item,
-                                      GraphDef* output, bool autotune) {
+absl::Status OptimizeWithMapParallelization(const GrapplerItem& item,
+                                            GraphDef* output, bool autotune) {
   MapParallelization optimizer;
   RewriterConfig_CustomGraphOptimizer config;
   if (autotune) {
@@ -43,7 +43,7 @@ Status OptimizeWithMapParallelization(const GrapplerItem& item,
 
 using graph_tests_utils::MakeMapNode;
 const char stateless_fun_name[] = "XTimesTwo";
-const char stateful_fun_name[] = "RandomUniform";
+const char stateful_fun_name[] = "RandomUniformFn";
 
 class AutotuneSetting : public ::testing::TestWithParam<bool> {};
 
@@ -75,10 +75,10 @@ TEST_P(AutotuneSetting, MapParallelizationTest) {
 
 INSTANTIATE_TEST_SUITE_P(Test, AutotuneSetting, ::testing::Values(false, true));
 
-class FromFunctionDef : public ::testing::TestWithParam<string> {};
+class FromFunctionDef : public ::testing::TestWithParam<std::string> {};
 
 TEST_P(FromFunctionDef, MapParallelizationTest) {
-  const string op = GetParam();
+  const std::string op = GetParam();
   bool from_function_def = (op == "_Retval");
 
   using test::function::NDef;

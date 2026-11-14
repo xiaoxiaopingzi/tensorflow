@@ -20,8 +20,10 @@ limitations under the License.
 #include <random>
 
 #include <gtest/gtest.h>
+#include "tensorflow/lite/c/c_api_types.h"
 #include "tensorflow/lite/delegates/xnnpack/quantized_binary_elementwise_tester.h"
 #include "tensorflow/lite/delegates/xnnpack/xnnpack_delegate.h"
+#include "tensorflow/lite/schema/schema_generated.h"
 
 namespace tflite {
 namespace xnnpack {
@@ -1004,8 +1006,7 @@ TEST(SignedQuantizedAdd, Relu6Activation) {
       .Test(BuiltinOperator_ADD, xnnpack_delegate.get());
 }
 
-// TODO(b/195554527): Re-enable this test
-TEST(SignedQuantizedAdd, DISABLED_ReluMinus1To1Activation) {
+TEST(SignedQuantizedAdd, ReluMinus1To1Activation) {
   std::unique_ptr<TfLiteDelegate, decltype(&TfLiteXNNPackDelegateDelete)>
       xnnpack_delegate(TfLiteXNNPackDelegateCreate(nullptr),
                        TfLiteXNNPackDelegateDelete);

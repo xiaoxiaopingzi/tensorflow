@@ -1,9 +1,25 @@
+# Copyright 2026 The TensorFlow Authors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
 # Description:
 #   Contains the Keras save model API (internal TensorFlow version).
 
-load("//tensorflow:tensorflow.bzl", "tf_py_test")
+load("@xla//third_party/rules_python/python:defs.bzl", "py_library")
 
 package(
+    # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
     # TODO(scottzhu): Remove non-keras deps from TF.
     default_visibility = [
         "//tensorflow/python/distribute:__pkg__",
@@ -32,13 +48,11 @@ py_library(
         "saving_utils.py",
     ],
     srcs_version = "PY3",
+    strict_deps = False,
     deps = [
-        "//tensorflow/python:lib",
-        "//tensorflow/python:math_ops",
-        "//tensorflow/python:platform",
-        "//tensorflow/python:saver",
-        "//tensorflow/python:tensor_spec",
+        "//tensorflow/python/checkpoint:graph_view",
         "//tensorflow/python/eager:def_function",
+        "//tensorflow/python/framework:tensor_spec",
         "//tensorflow/python/keras:backend",
         "//tensorflow/python/keras:losses",
         "//tensorflow/python/keras:optimizers",
@@ -51,109 +65,12 @@ py_library(
         "//tensorflow/python/keras/utils:engine_utils",
         "//tensorflow/python/keras/utils:metrics_utils",
         "//tensorflow/python/keras/utils:mode_keys",
+        "//tensorflow/python/lib/io:file_io",
+        "//tensorflow/python/ops:math_ops",
+        "//tensorflow/python/platform:gfile",
+        "//tensorflow/python/platform:tf_logging",
         "//tensorflow/python/saved_model",
-        "//tensorflow/python/training/tracking",
-    ],
-)
-
-tf_py_test(
-    name = "metrics_serialization_test",
-    size = "medium",
-    srcs = ["metrics_serialization_test.py"],
-    python_version = "PY3",
-    shard_count = 8,
-    tags = [
-        "notsan",  # TODO(b/170870790)
-    ],
-    deps = [
-        "//tensorflow/python:client_testlib",
-        "//tensorflow/python/keras",
-        "//third_party/py/numpy",
-        "@absl_py//absl/testing:parameterized",
-    ],
-)
-
-tf_py_test(
-    name = "losses_serialization_test",
-    size = "medium",
-    srcs = ["losses_serialization_test.py"],
-    python_version = "PY3",
-    shard_count = 4,
-    deps = [
-        "//tensorflow/python:client_testlib",
-        "//tensorflow/python/keras",
-        "//third_party/py/numpy",
-        "@absl_py//absl/testing:parameterized",
-    ],
-)
-
-tf_py_test(
-    name = "save_weights_test",
-    size = "medium",
-    srcs = ["save_weights_test.py"],
-    python_version = "PY3",
-    shard_count = 4,
-    tags = [
-        "no_oss_py35",  # b/147011479
-        "no_windows",
-    ],
-    deps = [
-        "//tensorflow/python:client_testlib",
-        "//tensorflow/python/keras",
-        "//tensorflow/python/keras:combinations",
-        "//third_party/py/numpy",
-        "@absl_py//absl/testing:parameterized",
-    ],
-)
-
-tf_py_test(
-    name = "save_test",
-    size = "medium",
-    srcs = ["save_test.py"],
-    python_version = "PY3",
-    shard_count = 4,
-    tags = [
-        "no_windows",  # TODO(b/192257375)
-    ],
-    deps = [
-        "//tensorflow/python:client_testlib",
-        "//tensorflow/python/feature_column:feature_column_v2",
-        "//tensorflow/python/keras",
-        "//tensorflow/python/keras:combinations",
-        "//third_party/py/numpy",
-        "@absl_py//absl/testing:parameterized",
-    ],
-)
-
-tf_py_test(
-    name = "saved_model_experimental_test",
-    size = "medium",
-    srcs = ["saved_model_experimental_test.py"],
-    python_version = "PY3",
-    shard_count = 4,
-    tags = [
-        "no_oss",  # TODO(b/119349471): Re-enable
-        "no_windows",
-    ],
-    deps = [
-        "//tensorflow/python:client_testlib",
-        "//tensorflow/python/keras",
-        "//third_party/py/numpy",
-        "@absl_py//absl/testing:parameterized",
-    ],
-)
-
-tf_py_test(
-    name = "saving_utils_test",
-    size = "medium",
-    srcs = ["saving_utils_test.py"],
-    python_version = "PY3",
-    tags = ["notsan"],
-    deps = [
-        "//tensorflow/python:client_testlib",
-        "//tensorflow/python/keras",
-        "//tensorflow/python/keras:combinations",
-        "//third_party/py/numpy",
-        "@absl_py//absl/testing:parameterized",
+        "//tensorflow/python/training:saver",
+        "@pypi//h5py",
     ],
 )

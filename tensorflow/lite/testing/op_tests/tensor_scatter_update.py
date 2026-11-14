@@ -13,12 +13,8 @@
 # limitations under the License.
 # ==============================================================================
 """Test configs for TensorScatterUpdate."""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import numpy as np
-import tensorflow.compat.v1 as tf
+import tensorflow as tf
 from tensorflow.lite.testing.zip_test_utils import create_tensor_data
 from tensorflow.lite.testing.zip_test_utils import make_zip_of_tests
 from tensorflow.lite.testing.zip_test_utils import register_make_test_function
@@ -29,7 +25,7 @@ def make_tensor_scatter_update_tests(options):
   """Make a set of tests to do tensor_scatter_update."""
 
   test_parameters = [{
-      "input_dtype": [tf.float32, tf.int32, tf.int64],
+      "input_dtype": [tf.float32, tf.int32, tf.int64, tf.bool],
       "input_shape": [[14], [2, 4, 7]],
       "updates_count": [1, 3, 5],
   }]

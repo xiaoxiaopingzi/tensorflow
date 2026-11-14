@@ -13,16 +13,12 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import weakref
 
 from absl.testing import parameterized
 import numpy as np
 
-from tensorflow.compiler.xla.service import hlo_pb2
+from xla.service import hlo_pb2
 from tensorflow.python.eager import context
 from tensorflow.python.eager import def_function
 from tensorflow.python.framework import constant_op
@@ -169,6 +165,27 @@ class ContextTest(test.TestCase, parameterized.TestCase):
     self.assertIn(concrete.name.decode(),
                   context.context().list_function_names())
 
+  def testCoordinationServiceMethodsInitializeNonGlobalContext(self):
+    # Each method must initialize its own (non-global) context before calling
+    # the C API; without a coordination service it then fails cleanly.
+    with self.assertRaisesRegex(
+        errors.FailedPreconditionError,
+        'Coordination service agent is not enabled',
+    ):
+      context.Context().set_config_key_value('key', 'value')
+    with self.assertRaisesRegex(
+        errors.FailedPreconditionError, 'Coordination service is not enabled'
+    ):
+      context.Context().get_config_key_value('key', timeout_in_ms=1)
+    with self.assertRaisesRegex(
+        errors.FailedPreconditionError, 'Coordination service is not enabled'
+    ):
+      context.Context().delete_config_key_value('key')
+    with self.assertRaisesRegex(
+        errors.FailedPreconditionError, 'Coordination service is not enabled'
+    ):
+      context.Context().wait_at_barrier('barrier', 1)
+
   def testSetLogicalDeviceAfterContextInitialization(self):
     ctx = context.Context()
     ctx.set_logical_cpu_devices(4)
@@ -177,6 +194,21 @@ class ContextTest(test.TestCase, parameterized.TestCase):
     # Cannot set logical device twice.
     with self.assertRaisesRegex(RuntimeError, 'Virtual CPUs already set'):
       ctx.set_logical_cpu_devices(8)
+
+  def testSetLogicalLocalCpuDevice(self):
+    ctx = context.Context()
+
+    # Manually add a remote CPU device into logical device list.
+    ctx._logical_devices = []  # pylint: disable=protected-access
+    dev = context.LogicalDevice(name='/job:worker/replica:0/task:1',
+                                device_type='CPU')
+    ctx._logical_devices.append(dev)  # pylint: disable=protected-access
+    self.assertIs(len(ctx.list_logical_devices('CPU')), 1)
+
+    # This would pass the check since the previously added device is not local.
+    ctx.set_logical_cpu_devices(4)
+    # Logical device list would be overwritten after initialization.
+    self.assertIs(len(ctx.list_logical_devices('CPU')), 4)
 
   @parameterized.named_parameters([(f'_{stage}', stage) for stage in [
       'hlo', 'hlo_serialized', 'optimized_hlo', 'optimized_hlo_serialized',

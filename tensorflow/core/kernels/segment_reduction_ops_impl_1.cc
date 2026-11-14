@@ -19,88 +19,98 @@ limitations under the License.
 namespace tensorflow {
 namespace internal {
 // Static routines not in the templated class to reduce code size
-Status ValidateSegmentReduction(OpKernelContext* context, const Tensor& input,
-                                const Tensor& segment_ids) {
+absl::Status ValidateSegmentReduction(OpKernelContext* context,
+                                      const Tensor& input,
+                                      const Tensor& segment_ids) {
   if (!TensorShapeUtils::IsVectorOrHigher(input.shape())) {
-    return errors::InvalidArgument("input must be at least rank 1");
+    return absl::InvalidArgumentError("input must be at least rank 1");
   }
   if (!TensorShapeUtils::IsVector(segment_ids.shape())) {
-    return errors::InvalidArgument("segment_ids should be a vector.");
+    return absl::InvalidArgumentError("segment_ids should be a vector.");
   }
   const int64_t num_indices = segment_ids.NumElements();
   if (num_indices != input.dim_size(0)) {
-    return errors::InvalidArgument(
+    return absl::InvalidArgumentError(
         "segment_ids should be the same size as dimension 0 of"
         " input.");
   }
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 // check routines not in the templated class to reduce code size
-Status ValidateUnsortedSegmentReduction(OpKernel* op_kernel,
-                                        OpKernelContext* context,
-                                        const Tensor& data,
-                                        const Tensor& segment_ids,
-                                        const Tensor& num_segments) {
+absl::Status ValidateUnsortedSegmentReduction(OpKernel* op_kernel,
+                                              OpKernelContext* context,
+                                              const Tensor& data,
+                                              const Tensor& segment_ids,
+                                              const Tensor& num_segments) {
   if (!TensorShapeUtils::IsScalar(num_segments.shape())) {
-    return errors::InvalidArgument(
-        "num_segments should be a scalar, not shape ",
-        num_segments.shape().DebugString());
+    return absl::InvalidArgumentError(
+        absl::StrCat("num_segments should be a scalar, not shape ",
+                     num_segments.shape().DebugString()));
   }
 
   if (!TensorShapeUtils::StartsWith(data.shape(), segment_ids.shape())) {
-    return errors::InvalidArgument("data.shape = ", data.shape().DebugString(),
-                                   " does not start with segment_ids.shape = ",
-                                   segment_ids.shape().DebugString());
+    return absl::InvalidArgumentError(
+        absl::StrCat("data.shape = ", data.shape().DebugString(),
+                     " does not start with segment_ids.shape = ",
+                     segment_ids.shape().DebugString()));
   }
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
-Status ValidateSparseSegmentReduction(OpKernelContext* context,
-                                      const Tensor& input,
-                                      const Tensor& indices,
-                                      const Tensor& segment_ids,
-                                      bool has_num_segments) {
+absl::Status ValidateSparseSegmentReduction(OpKernelContext* context,
+                                            const Tensor& input,
+                                            const Tensor& indices,
+                                            const Tensor& segment_ids,
+                                            bool has_num_segments) {
   if (has_num_segments) {
     const Tensor& num_segments_t = context->input(3);
     if (!TensorShapeUtils::IsScalar(num_segments_t.shape())) {
-      return errors::InvalidArgument(
-          "num_segments should be a scalar, not shape ",
-          num_segments_t.shape().DebugString());
+      return absl::InvalidArgumentError(
+          absl::StrCat("num_segments should be a scalar, not shape ",
+                       num_segments_t.shape().DebugString()));
     }
     int64_t output_rows =
         internal::SubtleMustCopy(num_segments_t.dtype() == DT_INT32
-                                     ? num_segments_t.scalar<int32>()()
+                                     ? num_segments_t.scalar<int32_t>()()
                                      : num_segments_t.scalar<int64_t>()());
     if (output_rows < 0) {
-      return errors::InvalidArgument("segment ids must be >= 0");
+      return absl::InvalidArgumentError("segment ids must be >= 0");
     }
   }
 
   if (!TensorShapeUtils::IsVector(indices.shape())) {
-    return errors::InvalidArgument("indices should be a vector.");
+    return absl::InvalidArgumentError("indices should be a vector.");
   }
 
   if (!TensorShapeUtils::IsVector(segment_ids.shape())) {
-    return errors::InvalidArgument("segment_ids should be a vector.");
+    return absl::InvalidArgumentError("segment_ids should be a vector.");
   }
 
   const int64_t num_indices = indices.NumElements();
   if (num_indices != segment_ids.NumElements()) {
-    return errors::InvalidArgument(
+    return absl::InvalidArgumentError(
         "segment_ids and indices should have same size.");
   }
 
   if (input.dims() < 1) {
-    return errors::InvalidArgument("Shape must be at least rank 1");
+    return absl::InvalidArgumentError("Shape must be at least rank 1");
   }
 
-  return Status::OK();
+  return absl::OkStatus();
 }
 
 }  // namespace internal
+
+template <typename T>
+using MinReducerPropagateNaN =
+    Eigen::internal::MinReducer<T, Eigen::PropagateNaN>;
+
+template <typename T>
+using MaxReducerPropagateNaN =
+    Eigen::internal::MaxReducer<T, Eigen::PropagateNaN>;
 
 #define REGISTER_CPU_KERNEL_SEGMENT(name, functor, type, index_type, \
                                     default_value)                   \
@@ -118,9 +128,9 @@ Status ValidateSparseSegmentReduction(OpKernelContext* context,
       "SegmentMean", Eigen::internal::MeanReducer<type>, type, index_type, 0); \
   REGISTER_CPU_KERNEL_SEGMENT(                                                 \
       "SegmentProd", Eigen::internal::ProdReducer<type>, type, index_type, 1); \
-  REGISTER_CPU_KERNEL_SEGMENT("SegmentMin", Eigen::internal::MinReducer<type>, \
+  REGISTER_CPU_KERNEL_SEGMENT("SegmentMin", MinReducerPropagateNaN<type>,      \
                               type, index_type, 0);                            \
-  REGISTER_CPU_KERNEL_SEGMENT("SegmentMax", Eigen::internal::MaxReducer<type>, \
+  REGISTER_CPU_KERNEL_SEGMENT("SegmentMax", MaxReducerPropagateNaN<type>,      \
                               type, index_type, 0)
 
 #define REGISTER_COMPLEX_CPU_KERNELS(type, index_type)                         \
@@ -147,33 +157,37 @@ REGISTER_COMPLEX_CPU_KERNELS_ALL(complex128);
 #undef REGISTER_COMPLEX_CPU_KERNELS_ALL
 
 #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
-#define REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                   \
-    name, type, index_type, initial_value_functor, reduction_kernel_functor, \
-    atomic_reduction_kernel_functor)                                         \
-  REGISTER_KERNEL_BUILDER(                                                   \
-      Name(name)                                                             \
-          .Device(DEVICE_GPU)                                                \
-          .TypeConstraint<type>("T")                                         \
-          .TypeConstraint<index_type>("Tindices"),                           \
-      SegmentReductionGPUOp<                                                 \
-          type, index_type,                                                  \
-          functor::SegmentReductionFunctor<                                  \
-              type, index_type, initial_value_functor,                       \
-              reduction_kernel_functor, atomic_reduction_kernel_functor> >)
+#define REGISTER_GPU_KERNEL_SORTEDSEGMENT(                            \
+    name, type, index_type, initial_value_functor,                    \
+    empty_segment_value_functor, reduction_kernel_functor, is_mean)   \
+  REGISTER_KERNEL_BUILDER(                                            \
+      Name(name)                                                      \
+          .Device(DEVICE_GPU)                                         \
+          .TypeConstraint<type>("T")                                  \
+          .TypeConstraint<index_type>("Tindices"),                    \
+      SegmentReductionGPUOp<                                          \
+          type, index_type,                                           \
+          functor::SegmentReductionFunctor<                           \
+              type, index_type, initial_value_functor,                \
+              empty_segment_value_functor, reduction_kernel_functor>, \
+          is_mean>)
 
-#define REGISTER_GPU_SORTED_KERNELS(type, index_type)                     \
-  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                      \
-      "SegmentSum", type, index_type, functor::Zero<type>,                \
-      functor::NonAtomicSumOpGpu<type>, functor::AtomicSumOpGpu<type>);   \
-  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                      \
-      "SegmentProd", type, index_type, functor::One<type>,                \
-      functor::NonAtomicProdOpGpu<type>, functor::AtomicProdOpGpu<type>); \
-  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                      \
-      "SegmentMin", type, index_type, functor::Highest<type>,             \
-      functor::NonAtomicMinOpGpu<type>, functor::AtomicMinOpGpu<type>);   \
-  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                      \
-      "SegmentMax", type, index_type, functor::Lowest<type>,              \
-      functor::NonAtomicMaxOpGpu<type>, functor::AtomicMaxOpGpu<type>);
+#define REGISTER_GPU_SORTED_KERNELS(type, index_type)                         \
+  REGISTER_GPU_KERNEL_SORTEDSEGMENT("SegmentSum", type, index_type,           \
+                                    functor::Zero<type>, functor::Zero<type>, \
+                                    functor::Sum, /*is_mean=*/false);         \
+  REGISTER_GPU_KERNEL_SORTEDSEGMENT("SegmentMean", type, index_type,          \
+                                    functor::Zero<type>, functor::Zero<type>, \
+                                    functor::Sum, /*is_mean=*/true);          \
+  REGISTER_GPU_KERNEL_SORTEDSEGMENT("SegmentProd", type, index_type,          \
+                                    functor::One<type>, functor::One<type>,   \
+                                    functor::Prod, /*is_mean=*/false);        \
+  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                          \
+      "SegmentMin", type, index_type, functor::Highest<type>,                 \
+      functor::Zero<type>, functor::Min, /*is_mean=*/false);                  \
+  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                          \
+      "SegmentMax", type, index_type, functor::Lowest<type>,                  \
+      functor::Zero<type>, functor::Max, /*is_mean=*/false);
 
 #define REGISTER_GPU_SORTED_KERNELS_ALL(type) \
   REGISTER_GPU_SORTED_KERNELS(type, int32)

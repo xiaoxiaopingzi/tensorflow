@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""File IO methods that wrap the C++ FileSystem API."""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+"""File IO methods that wrap the C++ FileSystem API.
+
+**Security Note:** These file I/O functions do not perform path validation or
+sandboxing. They do not prevent path traversal (e.g., using `..`), do not
+restrict access to any directory, and will follow symbolic links. Applications
+that accept file paths from untrusted sources (such as user input, model
+configurations, or checkpoint metadata) must validate and canonicalize paths
+before passing them to these functions.
+"""
 
 import binascii
+import io
 import os
+from posixpath import join as urljoin
 import uuid
 
 import six
@@ -48,11 +55,13 @@ class FileIO(object):
   the file line by line is 1024 * 512 bytes.
   """
 
-  def __init__(self, name, mode):
+  def __init__(self, name, mode, encoding="utf-8"):
     self.__name = name
     self.__mode = mode
+    self.__encoding = encoding
     self._read_buf = None
     self._writable_file = None
+    self._closed = False
     self._binary_mode = "b" in mode
     mode = mode.replace("b", "")
     if mode not in ("r", "w", "a", "r+", "w+", "a+"):
@@ -89,18 +98,40 @@ class FileIO(object):
 
   def _prepare_value(self, val):
     if self._binary_mode:
-      return compat.as_bytes(val)
+      return compat.as_bytes(val, encoding=self.__encoding)
     else:
-      return compat.as_str_any(val)
+      return compat.as_str_any(val, encoding=self.__encoding)
+
+  @property
+  def closed(self):
+    """Returns True if the file is closed."""
+    return self._closed
+
+  def fileno(self):
+    """Returns the underlying file descriptor if one exists.
+
+    Raises:
+      io.UnsupportedOperation: This always raises io.UnsupportedOperation
+        because TensorFlow FileIO doesn't support file descriptors.
+    """
+    raise io.UnsupportedOperation(
+        "File descriptors are not supported by TensorFlow FileIO"
+    )
 
   def size(self):
     """Returns the size of the file."""
     return stat(self.__name).length
 
   def write(self, file_content):
-    """Writes file_content to the file. Appends to the end of the file."""
+    """Writes file_content to the file.
+
+    In "w" mode, data is written at the current write position, which
+    seek() can move. In "a" and "a+" modes, data is always appended to
+    the end of the file.
+    """
     self._prewrite_check()
-    self._writable_file.append(compat.as_bytes(file_content))
+    self._writable_file.append(
+        compat.as_bytes(file_content, encoding=self.__encoding))
 
   def read(self, n=-1):
     """Returns the contents of a file as a string.
@@ -137,7 +168,10 @@ class FileIO(object):
         2: relative to the end of file. `offset` is usually negative.
     """
     # pylint: enable=g-doc-args
-    self._preread_check()
+    if self._read_check_passed:
+      self._preread_check()
+    else:
+      self._prewrite_check()
     # We needed to make offset a keyword argument for backwards-compatibility.
     # This check exists so that we can convert back to having offset be a
     # positional argument.
@@ -157,13 +191,18 @@ class FileIO(object):
     elif whence == 1:
       offset += self.tell()
     elif whence == 2:
+      if self._writable_file:
+        self._writable_file.flush()
       offset += self.size()
     else:
       raise errors.InvalidArgumentError(
           None, None,
           "Invalid whence argument: {}. Valid values are 0, 1, or 2.".format(
               whence))
-    self._read_buf.seek(offset)
+    if self._read_check_passed:
+      self._read_buf.seek(offset)
+    else:
+      self._writable_file.seek(offset)
 
   def readline(self):
     r"""Reads the next line, keeping \n. At EOF, returns ''."""
@@ -238,9 +277,12 @@ class FileIO(object):
     loss as last write might not have been replicated.
     """
     self._read_buf = None
+    if not self._closed and ("w" in self.__mode or "a" in self.__mode):
+      self._prewrite_check()
     if self._writable_file:
       self._writable_file.close()
       self._writable_file = None
+    self._closed = True
 
   def seekable(self):
     """Returns True as FileIO supports random access ops of seek()/tell()"""
@@ -773,10 +815,56 @@ def list_directory_v2(path):
 
   # Convert each element to string, since the return values of the
   # vector of string should be interpreted as strings, not bytes.
-  return [
-      compat.as_str_any(filename)
-      for filename in _pywrap_file_io.GetChildren(compat.path_to_bytes(path))
-  ]
+  # Strip trailing '/' so directory entries returned by cloud/remote
+  # filesystems (e.g. GCS delimiter prefixes) are consistent with local
+  # filesystems and Python's os.listdir.
+  entries = []
+  seen = set()
+  for filename in _pywrap_file_io.GetChildren(compat.path_to_bytes(path)):
+    name = compat.as_str_any(filename)
+    normalized = name.rstrip("/") or name
+    if normalized not in seen:
+      seen.add(normalized)
+      entries.append(normalized)
+  return entries
+
+
+@tf_export("io.gfile.join")
+def join(path, *paths):
+  r"""Join one or more path components intelligently.
+
+  TensorFlow specific filesystems will be joined
+  like a url (using "/" as the path seperator) on all platforms:
+
+  On Windows or Linux/Unix-like:
+  >>> tf.io.gfile.join("gcs://folder", "file.py")
+  'gcs://folder/file.py'
+
+  >>> tf.io.gfile.join("ram://folder", "file.py")
+  'ram://folder/file.py'
+
+  But the native filesystem is handled just like os.path.join:
+
+  >>> path = tf.io.gfile.join("folder", "file.py")
+  >>> if os.name == "nt":
+  ...   expected = "folder\\file.py"  # Windows
+  ... else:
+  ...   expected = "folder/file.py"  # Linux/Unix-like
+  >>> path == expected
+  True
+
+  Args:
+    path: string, path to a directory
+    paths: string, additional paths to concatenate
+
+  Returns:
+    path: the joined path.
+  """
+  # os.path.join won't take mixed bytes/str, so don't overwrite the incoming `path` var
+  path_ = compat.as_str_any(compat.path_to_str(path))
+  if "://" in path_[1:]:
+    return urljoin(path, *paths)
+  return os.path.join(path, *paths)
 
 
 @tf_export(v1=["gfile.Walk"])
@@ -816,12 +904,12 @@ def walk_v2(top, topdown=True, onerror=None):
   """
 
   def _make_full_path(parent, item):
-    # Since `os.path.join` discards paths before one that starts with the path
-    # separator (https://docs.python.org/3/library/os.path.html#os.path.join),
+    # Since `join` discards paths before one that starts with the path
+    # separator (https://docs.python.org/3/library/os.path.html#join),
     # we have to manually handle that case as `/` is a valid character on GCS.
     if item[0] == os.sep:
-      return "".join([os.path.join(parent, ""), item])
-    return os.path.join(parent, item)
+      return "".join([join(parent, ""), item])
+    return join(parent, item)
 
   top = compat.as_str_any(compat.path_to_str(top))
   try:
@@ -938,3 +1026,30 @@ def file_crc32(filename, block_size=_DEFAULT_BLOCK_SIZE):
       crc = binascii.crc32(chunk, crc)
       chunk = f.read(n=block_size)
   return hex(crc & 0xFFFFFFFF)
+
+
+@tf_export("io.gfile.get_registered_schemes")
+def get_registered_schemes():
+  """Returns the currently registered filesystem schemes.
+
+  The `tf.io.gfile` APIs, in addition to accepting traditional filesystem paths,
+  also accept file URIs that begin with a scheme. For example, the local
+  filesystem path `/tmp/tf` can also be addressed as `file:///tmp/tf`. In this
+  case, the scheme is `file`, followed by `://` and then the path, according to
+  [URI syntax](https://datatracker.ietf.org/doc/html/rfc3986#section-3).
+
+  This function returns the currently registered schemes that will be recognized
+  by `tf.io.gfile` APIs. This includes both built-in schemes and those
+  registered by other TensorFlow filesystem implementations, for example those
+  provided by [TensorFlow I/O](https://github.com/tensorflow/io).
+
+  The empty string is always included, and represents the "scheme" for regular
+  local filesystem paths.
+
+  Returns:
+    List of string schemes, e.g. `['', 'file', 'ram']`, in arbitrary order.
+
+  Raises:
+    errors.OpError: If the operation fails.
+  """
+  return _pywrap_file_io.GetRegisteredSchemes()

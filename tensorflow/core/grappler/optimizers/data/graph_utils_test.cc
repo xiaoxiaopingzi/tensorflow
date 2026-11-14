@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "tensorflow/core/grappler/optimizers/data/graph_utils.h"
 
+#include "tensorflow/core/framework/dataset_metadata.pb.h"
 #include "tensorflow/core/framework/function_testlib.h"
 #include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
@@ -24,6 +25,12 @@ namespace tensorflow {
 namespace grappler {
 namespace graph_utils {
 namespace {
+
+using test::function::NDef;
+
+constexpr char kOutputShapes[] = "output_shapes";
+constexpr char kOutputTypes[] = "output_types";
+constexpr char kToutputTypes[] = "Toutput_types";
 
 TEST(GraphUtilsTest, GetFirstElementIndexWithPredicate) {
   std::vector<int> vec({1, 2, 3, 4, 5, 6});
@@ -80,7 +87,7 @@ TEST(GraphUtilsTest, AddScalarConstNodeInt64) {
 TEST(GraphUtilsTest, AddScalarConstNodeString) {
   GraphDef graph_def;
   MutableGraphView graph(&graph_def);
-  NodeDef* string_node = AddScalarConstNode<StringPiece>("hello", &graph);
+  NodeDef* string_node = AddScalarConstNode<absl::string_view>("hello", &graph);
   EXPECT_TRUE(ContainsGraphNodeWithName(string_node->name(), *graph.graph()));
   EXPECT_EQ(string_node->attr().at("value").tensor().string_val(0), "hello");
 }
@@ -108,9 +115,9 @@ TEST(GraphUtilsTest, GetScalarConstNodeErrorWithNonConst) {
   MutableGraphView graph(&graph_def);
   NodeDef* non_const = AddScalarPlaceholder(DT_INT64, &graph);
   int64_t result;
-  Status s = GetScalarConstNodeValue<int64_t>(*non_const, &result);
+  absl::Status s = GetScalarConstNodeValue<int64_t>(*non_const, &result);
   EXPECT_FALSE(s.ok());
-  EXPECT_EQ(s.error_message(),
+  EXPECT_EQ(s.message(),
             "Node Placeholder is not a Const node. Op: Placeholder");
 }
 
@@ -119,9 +126,9 @@ TEST(GraphUtilsTest, GetScalarConstNodeErrorWithType) {
   MutableGraphView graph(&graph_def);
   NodeDef* int64_node = AddScalarConstNode<int64_t>(128, &graph);
   bool result;
-  Status s = GetScalarConstNodeValue<bool>(*int64_node, &result);
+  absl::Status s = GetScalarConstNodeValue<bool>(*int64_node, &result);
   EXPECT_FALSE(s.ok());
-  EXPECT_EQ(s.error_message(),
+  EXPECT_EQ(s.message(),
             "Node Const should have type bool but has type: int64");
 }
 
@@ -137,10 +144,9 @@ TEST(GraphUtilsTest, GetScalarConstNodeErrorWithVector) {
   tensor->add_int64_val(128);
 
   int64_t result;
-  Status s = GetScalarConstNodeValue<int64_t>(node, &result);
+  absl::Status s = GetScalarConstNodeValue<int64_t>(node, &result);
   EXPECT_FALSE(s.ok());
-  EXPECT_EQ(s.error_message(),
-            "Node Const should be a scalar but has shape: [1]");
+  EXPECT_EQ(s.message(), "Node Const should be a scalar but has shape: [1]");
 }
 
 TEST(GraphUtilsTest, Compare) {
@@ -308,7 +314,7 @@ TEST(GraphUtilsTest, EnsureNodeNamesUnique) {
 
   // Arbitrary const
   Tensor tensor(DT_INT32, {});
-  tensor.scalar<int32>()() = 5;
+  tensor.scalar<int32_t>()() = 5;
 
   for (auto node : {&const_0, &const_1}) {
     TF_EXPECT_OK(NodeBuilder("Const", "Const")
@@ -353,7 +359,7 @@ TEST(GraphUtilsTest, TestFindSinkNodeMultipleFetches) {
   item.fetch.push_back(node3->name());
 
   NodeDef* sink_node;
-  Status s = GetFetchNode(graph, item, &sink_node);
+  absl::Status s = GetFetchNode(graph, item, &sink_node);
   EXPECT_FALSE(s.ok());
 }
 
@@ -366,8 +372,51 @@ TEST(GraphUtilsTest, TestFindSinkNodeNoFetches) {
   AddNode("node3", "Identity", {node2->name()}, {}, &graph);
 
   NodeDef* sink_node;
-  Status s = GetFetchNode(graph, item, &sink_node);
+  absl::Status s = GetFetchNode(graph, item, &sink_node);
   EXPECT_FALSE(s.ok());
+}
+
+TEST(GraphUtilsTest, TestCopyShapesAndTypesAttrsNoShapes) {
+  NodeDef from = NDef("range", "RangeDataset", {},
+                      {{kOutputTypes, absl::Span<const DataType>{}}});
+  NodeDef to_node;
+  EXPECT_FALSE(CopyShapesAndTypesAttrs(from, &to_node));
+}
+
+TEST(GraphUtilsTest, TestCopyShapesAndTypesAttrsNoTypes) {
+  NodeDef from = NDef("range", "RangeDataset", {},
+                      {{kOutputShapes, absl::Span<const TensorShape>{}}});
+  NodeDef to_node;
+  EXPECT_FALSE(CopyShapesAndTypesAttrs(from, &to_node));
+}
+
+TEST(GraphUtilsTest, TestCopyShapesAndTypesAttrsOutputTypes) {
+  NodeDef from = NDef("range", "RangeDataset", {},
+                      {{kOutputShapes, 666}, {kOutputTypes, 888}});
+  NodeDef to_node;
+  EXPECT_TRUE(CopyShapesAndTypesAttrs(from, &to_node));
+  EXPECT_EQ(to_node.attr().at(kOutputShapes).i(), 666);
+  EXPECT_EQ(to_node.attr().at(kOutputTypes).i(), 888);
+}
+
+TEST(GraphUtilsTest, TestCopyShapesAndTypesAttrsToutputTypes) {
+  NodeDef from = NDef("tensor", "TensorDataset", {},
+                      {{kOutputShapes, 666}, {kToutputTypes, 888}});
+  NodeDef to_node;
+  EXPECT_TRUE(CopyShapesAndTypesAttrs(from, &to_node));
+  EXPECT_EQ(to_node.attr().at(kOutputShapes).i(), 666);
+  EXPECT_EQ(to_node.attr().at(kOutputTypes).i(), 888);
+}
+
+TEST(GraphUtilsTest, TestSetMetadataName) {
+  NodeDef node = NDef("range", "RangeDataset", {},
+                      {{kOutputShapes, 666}, {kOutputTypes, 888}});
+  EXPECT_TRUE(SetMetadataName("metadata_name", &node).ok());
+  EXPECT_TRUE(node.attr().contains("metadata"));
+  data::Metadata metadata;
+  metadata.ParseFromString(node.attr().at("metadata").s());
+  EXPECT_EQ("metadata_name", metadata.name());
+  EXPECT_FALSE(SetMetadataName("new_metadata_name", &node).ok());
 }
 
 }  // namespace

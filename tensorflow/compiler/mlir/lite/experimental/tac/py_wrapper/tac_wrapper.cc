@@ -16,10 +16,12 @@ limitations under the License.
 #include "tensorflow/compiler/mlir/lite/experimental/tac/py_wrapper/tac_wrapper.h"
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "absl/status/status.h"
-#include "tensorflow/compiler/mlir/lite/experimental/tac/common/targets.h"
-#include "tensorflow/compiler/mlir/lite/experimental/tac/common/utils.h"
+#include "mlir/IR/DialectRegistry.h"  // from @llvm-project
+#include "tensorflow/compiler/mlir/lite/experimental/tac/tac_importer_exporter.h"
 #include "tensorflow/compiler/mlir/lite/experimental/tac/tac_module.h"
 #include "tensorflow/compiler/mlir/lite/experimental/tac/tflite_import_export.h"
 #include "tensorflow/compiler/mlir/lite/experimental/tac/transforms/passes.h"
@@ -55,6 +57,8 @@ bool run_tac(const std::string& model_file_path,
              const std::string& model_output_path) {
   mlir::TFL::tac::TacModule::Options options;
   options.hardware_backends = device_specs;
+  options.enable_inliner = true;
+  options.legalize_to_tflite_ops = true;
   mlir::TFL::tac::TacModule tac_module(options);
   mlir::DialectRegistry registry;
   mlir::RegisterAllTensorFlowDialects(registry);

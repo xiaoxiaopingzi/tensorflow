@@ -48,15 +48,14 @@ class RuntimeFallbackTensor final
   template <typename T>
   static void PrintTensorValues(void* data, ssize_t size,
                                 llvm::raw_ostream& os) {
-    llvm::ArrayRef<T> elements =
-        llvm::makeArrayRef(static_cast<T*>(data), size);
+    llvm::ArrayRef<T> elements = llvm::ArrayRef(static_cast<T*>(data), size);
     llvm::interleaveComma(elements, os);
   }
 
   OwnedTensorHandle tensor_handle_;
 };
 
-llvm::SmallVector<ssize_t, 4> GetShape(
+llvm::SmallVector<tfrt::Index, 4> GetShape(
     AbstractTensorInterface* tensor_interface);
 
 tfrt::Expected<tfrt::StringHostTensor> CopyTfStringTensorToStringHostTensor(

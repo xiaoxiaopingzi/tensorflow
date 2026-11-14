@@ -33,10 +33,12 @@ limitations under the License.
 
 #include <Python.h>
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/synchronization/mutex.h"
 #include "tensorflow/python/lib/core/safe_pyobject_ptr.h"
 #include "tensorflow/python/util/function_parameter_canonicalizer.h"
 
@@ -56,8 +58,9 @@ class PySignatureChecker;
 // checks if any registered target matches parameters, and if so, then calls
 // that target.
 //
-// This class is *not* thread-safe.  It is assumed that the Python Global
-// Interpreter Lock (GIL) will be held when any method is called.
+// This class supports concurrent use in free-threaded Python builds.
+// Internal mutable state is synchronized, and Python object lifetimes used
+// across concurrent operations are protected with owned references/snapshots.
 class PythonAPIDispatcher {
   // TODO(b/196369143) Add benchmarking for this class.
  public:
@@ -98,17 +101,15 @@ class PythonAPIDispatcher {
   // Name of the API.
   std::string api_name_;
 
+  // Protects access to targets_. Stored indirectly so the dispatcher remains
+  // movable when returned by value from the pybind constructor factory.
+  std::unique_ptr<absl::Mutex> targets_mu_;
+
   // Mapping from signature checkers to dispatch targets.
   std::vector<std::pair<PySignatureChecker, Safe_PyObjectPtr>> targets_;
 
   // Parameter canonicalizer.
   FunctionParameterCanonicalizer canonicalizer_;
-
-  // Target storage for canonicalization.  (Note: for efficiency, `Dispatch`
-  // writes to this pre-allocated storage, rather than allocating new storage
-  // each time it is called.)
-  std::vector<PyObject*> canonicalized_args_storage_;
-  absl::Span<PyObject*> canonicalized_args_span_;
 };
 
 // Registers a type for use with dispatch.  Dispatch will only occur if at least
@@ -198,7 +199,7 @@ class PyTypeChecker {
   // Approximate cost of calling this type checker, so we can perform less
   // expensive checks first.  (E.g., checking if every element in a list has a
   // given type is more costly than checking a single value.)
-  virtual int cost() = 0;
+  virtual int cost() const = 0;
 
   virtual std::string DebugString() const = 0;
 };
@@ -206,28 +207,27 @@ class PyTypeChecker {
 // PyTypeChecker that checks if a value is an instance of a given Python type.
 class PyInstanceChecker : public PyTypeChecker {
  public:
-  explicit PyInstanceChecker(PyObject* py_class);
+  explicit PyInstanceChecker(const std::vector<PyObject*>& py_classes);
   ~PyInstanceChecker() override;
   MatchType Check(PyObject* value) override;
-  int cost() override { return 1; }
+  int cost() const override;
   std::string DebugString() const override;
 
   // Size of the cache (for regression testing).
-  size_t cache_size() const { return py_class_cache_.size(); }
+  size_t cache_size() const {
+    absl::MutexLock lock(*py_class_cache_mu_.get());
+    return py_class_cache_.size();
+  }
 
  private:
   // Python class to check values against.
-  Safe_PyObjectPtr py_class_;
+  std::vector<Safe_PyObjectPtr> py_classes_;
 
-  // Value to return if the value is a subclass of `py_type_`.  Either MATCH or
-  // MATCH_DISPATCHABLE (depending on whether py_class_ has been registered
-  // for dispatch).
-  MatchType match_type_;
+  // Protects access to py_class_cache_.
+  std::unique_ptr<absl::Mutex> py_class_cache_mu_;
 
-  // Cache to avoid having to call PyObject_IsInstance.  Note: we rely on the
-  // Python GIL (global interpreter lock) to avoid concurrent writes to this
-  // cache, since `Check()` is always called from Python (via pybind11).
-  absl::flat_hash_map<PyTypeObject*, bool> py_class_cache_;
+  // Cache to avoid having to call PyObject_IsInstance.
+  absl::flat_hash_map<PyTypeObject*, MatchType> py_class_cache_;
 
   // Maximum cache size.  In typical user programs, the cache will never become
   // full, but we use a maximum size in case the user creates types dynamically,
@@ -243,7 +243,7 @@ class PyListChecker : public PyTypeChecker {
   explicit PyListChecker(PyTypeChecker_ptr element_type)
       : element_type_(element_type) {}
   MatchType Check(PyObject* value) override;
-  int cost() override;
+  int cost() const override;
   std::string DebugString() const override;
 
  private:
@@ -257,7 +257,7 @@ class PyUnionChecker : public PyTypeChecker {
   explicit PyUnionChecker(std::vector<PyTypeChecker_ptr> options)
       : options_(options) {}
   MatchType Check(PyObject* value) override;
-  int cost() override;
+  int cost() const override;
   std::string DebugString() const override;
 
  private:

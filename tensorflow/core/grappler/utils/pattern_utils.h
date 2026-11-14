@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef TENSORFLOW_CORE_GRAPPLER_UTILS_PATTERN_HELPER_H_
-#define TENSORFLOW_CORE_GRAPPLER_UTILS_PATTERN_HELPER_H_
+#ifndef TENSORFLOW_CORE_GRAPPLER_UTILS_PATTERN_UTILS_H_
+#define TENSORFLOW_CORE_GRAPPLER_UTILS_PATTERN_UTILS_H_
 
 #include "tensorflow/core/grappler/utils/graph_view.h"
 
@@ -126,13 +126,13 @@ enum class NodeStatus { kRemain, kRemove, kReplace };
 // TODO (intel-tf): Support multiple roots by making them children of a single
 // virtual root.
 struct OpTypePattern {
-  string op;
-  string label;
+  std::string op;
+  std::string label;
   NodeStatus node_status;
   std::vector<OpTypePattern> children;
 
-  string DebugString() const {
-    string result = "{(op: " + op + ", " + "label: " + label + "), {";
+  std::string DebugString() const {
+    std::string result = "{(op: " + op + ", " + "label: " + label + "), {";
     for (const OpTypePattern& child : children) {
       result += child.DebugString() + ",";
     }
@@ -148,8 +148,8 @@ struct NodeViewMatch {
   MutableNodeView* node_view = nullptr;
   std::vector<NodeViewMatch> children;
 
-  string DebugString() const {
-    string result = "{";
+  std::string DebugString() const {
+    std::string result = "{";
     if (node_view == nullptr) {
       result += "Non-Matched-Node}";
       return result;
@@ -182,13 +182,15 @@ class SubGraphMatcher {
 
   // If a given pattern is matched, this function returns true as well as the
   // matched node and remove node info is populated.
-  bool GetMatchedNodes(const OpTypePattern& pattern, MutableNodeView* node_view,
-                       std::map<string, int>* matched_nodes_map,
+  bool GetMatchedNodes(const OpTypePattern& pattern,
+                       const std::unordered_set<std::string>& nodes_to_preserve,
+                       MutableNodeView* node_view,
+                       std::map<std::string, int>* matched_nodes_map,
                        std::set<int>* remove_node_indices);
 
  private:
   MutableGraphView* graph_view_;
-  std::map<string, int> node_label_to_index_;
+  std::map<std::string, int> node_label_to_index_;
   std::set<int> matched_node_indices_;
   std::set<int> remove_node_indices_;
   std::unique_ptr<NodeViewMatch> match_ = nullptr;
@@ -200,9 +202,13 @@ class SubGraphMatcher {
   // potential matched nodes (i.e. when DoesOpTypePatternMatch returns "true").
   // It performs a sanity check if the candidate nodes for removal in subgraph
   // fusion is indeed safe to remove.
-  bool HasRemoveNodeExternalDependents() {
+  bool IsSafeNodesToRemove(
+      const std::unordered_set<std::string>& nodes_to_preserve) {
     for (const auto& node_idx : remove_node_indices_) {
       auto node_view = graph_view_->GetNode(node_idx);
+      // Check if the node to be removed is in the nodes to be preserved.
+      std::string node_name = node_view->GetName();
+      if (nodes_to_preserve.count(node_name) > 0) return false;
       // Traverse all the Regular Fanouts. Fanouts are stored as vector of
       // vector, std::vector<std::vector<MutableFaninView>>. Note that
       // a MutableNodeView's fanouts are stored in a nested vector of
@@ -211,17 +217,29 @@ class SubGraphMatcher {
       for (const auto& fanouts : fanouts_by_ports) {
         for (const auto& fanout : fanouts) {
           if (!matched_node_indices_.count(fanout.node_index())) {
-            return true;
+            return false;
           }
         }
       }
     }
-    return false;
+    return true;
   }
 };
+
+template <>
+bool SubGraphMatcher<MatchingDirection::kFollowInputs>::DoesOpTypePatternMatch(
+    const OpTypePattern& pattern, MutableNodeView* node_view,
+    NodeViewMatch* match);
+
+template <>
+bool SubGraphMatcher<MatchingDirection::kFollowInputs>::GetMatchedNodes(
+    const OpTypePattern& pattern,
+    const std::unordered_set<std::string>& nodes_to_preserve,
+    MutableNodeView* node_view, std::map<std::string, int>* matched_nodes_map,
+    std::set<int>* remove_node_indices);
 
 }  // namespace utils
 }  // namespace grappler
 }  // namespace tensorflow
 
-#endif  // TENSORFLOW_CORE_GRAPPLER_UTILS_PATTERN_HELPER_H_
+#endif  // TENSORFLOW_CORE_GRAPPLER_UTILS_PATTERN_UTILS_H_

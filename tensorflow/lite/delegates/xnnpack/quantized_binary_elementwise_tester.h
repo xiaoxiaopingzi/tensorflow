@@ -20,7 +20,7 @@ limitations under the License.
 #include <vector>
 
 #include <gtest/gtest.h>
-#include "tensorflow/lite/c/common.h"
+#include "tensorflow/lite/core/c/common.h"
 #include "tensorflow/lite/interpreter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
@@ -168,7 +168,7 @@ class QuantizedBinaryElementwiseTester {
   int32_t output_zero_point_ = 0;
   float input1_scale_ = 0.75f;
   float input2_scale_ = 1.0f;
-  float output_scale_ = 2.0f;
+  float output_scale_ = 1.75f;
   bool unsigned_ = false;
   ::tflite::ActivationFunctionType activation_ =
       ::tflite::ActivationFunctionType_NONE;

@@ -16,7 +16,12 @@ limitations under the License.
 #ifndef TENSORFLOW_CORE_GRAPPLER_OPTIMIZERS_DATA_AUTO_SHARD_H_
 #define TENSORFLOW_CORE_GRAPPLER_OPTIMIZERS_DATA_AUTO_SHARD_H_
 
+#include <string>
+#include <vector>
+
 #include "tensorflow/core/framework/dataset_options.pb.h"
+#include "tensorflow/core/framework/node_def.pb.h"
+#include "tensorflow/core/grappler/mutable_graph_view.h"
 #include "tensorflow/core/grappler/optimizers/data/optimizer_base.h"
 
 namespace tensorflow {
@@ -27,16 +32,17 @@ class AutoShard : public TFDataOptimizerBase {
   AutoShard() = default;
   ~AutoShard() override = default;
 
-  string name() const override { return "tf_auto_shard"; }
+  std::string name() const override { return "tf_auto_shard"; }
 
   bool UsesFunctionLibrary() const override { return true; }
 
-  Status Init(
+  absl::Status Init(
       const tensorflow::RewriterConfig_CustomGraphOptimizer* config) override;
 
-  Status OptimizeAndCollectStats(Cluster* cluster, const GrapplerItem& item,
-                                 GraphDef* output,
-                                 OptimizationStats* stats) override;
+  absl::Status OptimizeAndCollectStats(Cluster* cluster,
+                                       const GrapplerItem& item,
+                                       GraphDef* output,
+                                       OptimizationStats* stats) override;
 
  private:
   int64_t num_workers_;
@@ -44,6 +50,13 @@ class AutoShard : public TFDataOptimizerBase {
   int64_t index_;
   tensorflow::data::AutoShardPolicy auto_shard_policy_;
 };
+
+// For testing only
+namespace internal {
+bool IsEligibleRewriteBatchSize(const NodeDef& sink_node,
+                                const MutableGraphView& graph,
+                                std::vector<std::string>* ineligible_reason);
+}
 
 }  // namespace grappler
 }  // namespace tensorflow

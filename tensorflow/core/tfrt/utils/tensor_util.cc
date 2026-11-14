@@ -23,7 +23,7 @@ limitations under the License.
 
 #include "absl/container/inlined_vector.h"
 #include "absl/strings/str_cat.h"
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/types.h"
@@ -33,8 +33,6 @@ limitations under the License.
 #include "tensorflow/core/runtime_fallback/kernel/kernel_fallback_tensor.h"
 #include "tensorflow/core/runtime_fallback/util/tensor_util.h"
 #include "tensorflow/core/runtime_fallback/util/type_util.h"
-#include "tensorflow/core/tfrt/utils/statusor.h"
-#include "tensorflow/stream_executor/lib/statusor.h"
 #include "tfrt/core_runtime/tensor_handle.h"  // from @tf_runtime
 #include "tfrt/dtype/dtype.h"  // from @tf_runtime
 #include "tfrt/host_context/host_buffer.h"  // from @tf_runtime
@@ -51,6 +49,8 @@ limitations under the License.
 namespace tfrt {
 namespace {
 
+using ::tensorflow::StatusOr;
+
 llvm::Expected<tensorflow::Tensor> CopyScalarHostTensorToTFTensor(
     const AnyScalarHostTensor& tensor) {
   auto element_byte_size = GetHostSize(tensor.dtype());
@@ -61,7 +61,7 @@ llvm::Expected<tensorflow::Tensor> CopyScalarHostTensorToTFTensor(
         tensor.dtype());
   }
 
-  llvm::SmallVector<ssize_t, 4> dims;
+  llvm::SmallVector<Index, 4> dims;
   tensor.shape().GetDimensions(&dims);
 
   auto tf_dtype = tensorflow::tfd::GetTfDataType(tensor.dtype());
@@ -84,34 +84,32 @@ llvm::Expected<tensorflow::Tensor> CopyScalarHostTensorToTFTensor(
   return tf_tensor;
 }
 
-StatusOr<DType> ConvertTFDTypeToTFRTDType(tensorflow::DataType dtype) {
+absl::StatusOr<DType> ConvertTFDTypeToTFRTDType(tensorflow::DataType dtype) {
   switch (dtype) {
 #define DTYPE(TFRT_DTYPE, TF_DTYPE) \
   case tensorflow::TF_DTYPE:        \
     return DType(DType::TFRT_DTYPE);
 #include "tensorflow/core/tfrt/utils/dtype.def"
     default:
-      return tensorflow::errors::Internal(absl::StrCat(
+      return absl::InternalError(absl::StrCat(
           "unsupported tensorflow dtype: ", tensorflow::DataType_Name(dtype)));
   }
 }
 
-StatusOr<tensorflow::DataType> ConvertTFRTDTypeToTFDType(DType dtype) {
+absl::StatusOr<tensorflow::DataType> ConvertTFRTDTypeToTFDType(DType dtype) {
   switch (dtype) {
 #define DTYPE(TFRT_DTYPE, TF_DTYPE) \
   case DType::TFRT_DTYPE:           \
     return tensorflow::TF_DTYPE;
 #include "tensorflow/core/tfrt/utils/dtype.def"
     default:
-      return tensorflow::errors::Internal(
-          StrCat("unsupported tfrt dtype: ", dtype));
+      return absl::InternalError(StrCat("unsupported tfrt dtype: ", dtype));
   }
 }
 
 }  // namespace
 
-llvm::Expected<tensorflow::Tensor> TFRTTensorToTFTensor(const Tensor& tensor,
-                                                        HostContext* host) {
+llvm::Expected<tensorflow::Tensor> TFRTTensorToTFTensor(const Tensor& tensor) {
   if (auto* knfbt = llvm::dyn_cast<tensorflow::KernelFallbackTensor>(&tensor)) {
     return *knfbt->GetTensor();
   }
@@ -119,7 +117,7 @@ llvm::Expected<tensorflow::Tensor> TFRTTensorToTFTensor(const Tensor& tensor,
   // Tensor so we don't have to re-implement it.
   if (auto* dht = llvm::dyn_cast<DenseHostTensor>(&tensor)) {
     return tensorflow::tfd::MoveHostBufferToTfTensor(
-        dht->buffer().CopyRef(), dht->dtype(), dht->shape());
+        dht->buffer(), dht->dtype(), dht->shape());
   }
   if (auto* sht = llvm::dyn_cast<StringHostTensor>(&tensor)) {
     return tensorflow::tfd::CopyShtToTfTensor(*sht);
@@ -133,19 +131,18 @@ llvm::Expected<tensorflow::Tensor> TFRTTensorToTFTensor(const Tensor& tensor,
 
 AsyncValueRef<TensorHandle> TFTensorToTFRTTensorHandle(
     const tensorflow::Tensor& tf_tensor, HostContext* host_ctx) {
-  auto knfbt = MakeAvailableAsyncValueRef<tensorflow::KernelFallbackTensor>(
-      host_ctx, tf_tensor);
+  auto knfbt =
+      MakeAvailableAsyncValueRef<tensorflow::KernelFallbackTensor>(tf_tensor);
   return MakeAvailableAsyncValueRef<TensorHandle>(
-      host_ctx, host_ctx->GetHostDeviceRef(), knfbt->metadata(),
-      std::move(knfbt));
+      host_ctx->GetHostDeviceRef(), knfbt->metadata(), std::move(knfbt));
 }
 
-StatusOr<TensorHandle> CreateTensorHandleFromTFTensor(
+absl::StatusOr<TensorHandle> CreateTensorHandleFromTFTensor(
     const tensorflow::Tensor& tensor, HostContext* host) {
   // TODO(chky): Handle non-trivial types such as strings.
   TF_ASSIGN_OR_RETURN(auto dtype, ConvertTFDTypeToTFRTDType(tensor.dtype()));
   auto shape = tensor.shape().dim_sizes();
-  TensorMetadata metadata(dtype, TensorShape(llvm::SmallVector<ssize_t, 4>(
+  TensorMetadata metadata(dtype, TensorShape(llvm::SmallVector<Index, 4>(
                                      shape.begin(), shape.end())));
 
   if (dtype == DType::String) {
@@ -171,11 +168,11 @@ StatusOr<TensorHandle> CreateTensorHandleFromTFTensor(
   return TensorHandle(host->GetHostDeviceRef(), metadata, std::move(dht_ref));
 }
 
-StatusOr<tensorflow::Tensor> CreateTFTensorFromTensorHandle(
+absl::StatusOr<tensorflow::Tensor> CreateTFTensorFromTensorHandle(
     const TensorHandle& tensor_handle) {
   const auto& metadata = tensor_handle.GetAvailableMetadata();
   TF_ASSIGN_OR_RETURN(auto dtype, ConvertTFRTDTypeToTFDType(metadata.dtype));
-  llvm::SmallVector<ssize_t, 4> shape;
+  llvm::SmallVector<Index, 4> shape;
   metadata.shape.GetDimensions(&shape);
   const auto& host_tensor = tensor_handle.GetAsyncTensor()->get<HostTensor>();
 
@@ -211,7 +208,26 @@ StatusOr<tensorflow::Tensor> CreateTFTensorFromTensorHandle(
     return tensor;
   }
 
-  return tensorflow::errors::Internal("unknown host tensor type");
+  return absl::InternalError("unknown host tensor type");
+}
+
+Expected<tfrt::DenseHostTensor> ConvertTfTensorToDHT(
+    tensorflow::Tensor tf_tensor) {
+  auto metadata = tensorflow::tfd::GetTensorMetadata(tf_tensor);
+  if (!IsTriviallyCopyable(metadata.dtype))
+    return MakeStringError(
+        "Cannot convert tf Tensor with non-trivially copyable dtype to DHT");
+
+  void* data = tf_tensor.data();
+  size_t size = tf_tensor.AllocatedBytes();
+  tfrt::RCReference<tfrt::HostBuffer> host_buffer =
+      tfrt::HostBuffer::CreateFromExternal(
+          data, size, [tf_tensor = std::move(tf_tensor)](void*, size_t) {});
+
+  // Assume HostBuffer::CreateFromExternal never fails.
+  assert(host_buffer);
+
+  return tfrt::DenseHostTensor(metadata, std::move(host_buffer));
 }
 
 }  // namespace tfrt

@@ -16,8 +16,10 @@ limitations under the License.
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "absl/status/status.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"  // from @llvm-project
 #include "mlir/Transforms/Passes.h"  // from @llvm-project
 #include "tensorflow/compiler/mlir/lite/experimental/tac/hardwares/target_hardware.h"
 #include "tensorflow/compiler/mlir/lite/experimental/tac/transforms/passes.h"
@@ -28,16 +30,17 @@ namespace mlir {
 namespace TFL {
 namespace tac {
 namespace {
-// TODO(b/177376459): We should make this configureable.
-void AddExportTFLPass(mlir::OpPassManager* pass_manager) {
-  pass_manager->addPass(mlir::createInlinerPass());
+// TODO(b/177376459): We should make this configurable.
+void AddExportTFLPass(mlir::OpPassManager* pass_manager, bool enable_inliner) {
+  if (enable_inliner) pass_manager->addPass(mlir::createInlinerPass());
   pass_manager->addPass(mlir::createSymbolDCEPass());
-  pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCanonicalizerPass());
-  pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCSEPass());
+  pass_manager->addNestedPass<mlir::func::FuncOp>(
+      mlir::createCanonicalizerPass());
+  pass_manager->addNestedPass<mlir::func::FuncOp>(mlir::createCSEPass());
 }
 }  // namespace
 
-// TODO(b/177376459): We should make this configureable.
+// TODO(b/177376459): We should make this configurable.
 void TacModule::AddTACPass(mlir::OpPassManager* pass_manager,
                            llvm::ArrayRef<std::string> device_specs) {
   pass_manager->addPass(mlir::TFL::tac::CreateTargetAnnotationPass(this));
@@ -46,19 +49,21 @@ void TacModule::AddTACPass(mlir::OpPassManager* pass_manager,
       /*fold_all_constants=*/false));
   pass_manager->addPass(
       mlir::TFL::tac::CreateAlternativeSubgraphPass(device_specs));
-  // After we creat the alternative subgraph, we can still do canonicalization
-  // legalization & other optimizations as long as we're not inlining the
-  // function.
-  // And in fact, we probably need to do the proper legalization, for the
-  // compute cost to work. (in case we added some TF ops)
-  pass_manager->addPass(mlir::TFL::CreatePrepareTFPass(
-      /*unfold_batch_matmul=*/true,
-      /*allow_bf16_and_f16_type_legalization=*/false));
-  pass_manager->addNestedPass<mlir::FuncOp>(mlir::createCanonicalizerPass());
-  pass_manager->addPass(
-      mlir::TFL::CreateLegalizeTFPass(/*run_tfl_runtime_verification=*/true));
-  pass_manager->addPass(
-      mlir::TFL::CreateOptimizePass(/*enable_canonicalization=*/true));
+  if (options_.legalize_to_tflite_ops) {
+    // After we creat the alternative subgraph, we can still do canonicalization
+    // legalization & other optimizations as long as we're not inlining the
+    // function.
+    // And in fact, we probably need to do the proper legalization, for the
+    // compute cost to work. (in case we added some TF ops)
+    pass_manager->addPass(mlir::TFL::CreatePrepareTFPass(
+        /*unfold_batch_matmul=*/true,
+        /*allow_bf16_and_f16_type_legalization=*/false));
+    pass_manager->addNestedPass<mlir::func::FuncOp>(
+        mlir::createCanonicalizerPass());
+    pass_manager->addPass(
+        mlir::TFL::CreateLegalizeTFPass(/*run_tfl_runtime_verification=*/true));
+    pass_manager->addPass(mlir::TFL::CreateOptimizePass());
+  }
 
   pass_manager->addPass(mlir::TFL::tac::CreateComputeCostPass());
   pass_manager->addPass(mlir::TFL::tac::CreatePickSubgraphsPass());
@@ -75,11 +80,11 @@ const tac::TargetHardware* TacModule::GetTargetHardware(
 }
 
 absl::Status TacModule::RunTacPasses(mlir::ModuleOp* module, bool debug_mode) {
-  mlir::PassManager pm(module->getContext(),
+  mlir::PassManager pm((*module)->getName(),
                        mlir::OpPassManager::Nesting::Implicit);
   AddTACPass(&pm, options_.hardware_backends);
   if (!debug_mode) {
-    AddExportTFLPass(&pm);
+    AddExportTFLPass(&pm, options_.enable_inliner);
   }
 
   mlir::StatusScopedDiagnosticHandler statusHandler(module->getContext(),

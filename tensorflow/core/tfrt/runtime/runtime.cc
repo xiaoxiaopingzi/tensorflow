@@ -14,160 +14,48 @@ limitations under the License.
 ==============================================================================*/
 #include "tensorflow/core/tfrt/runtime/runtime.h"
 
-#include <string>
+#include <functional>
+#include <memory>
 #include <utility>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/platform/cpu_info.h"
 #include "tensorflow/core/platform/status.h"
-#include "tensorflow/core/runtime_fallback/kernel/kernel_fallback_op_handler.h"
 #include "tensorflow/core/runtime_fallback/kernel/kernel_fallback_tensor.h"
-#include "tensorflow/core/runtime_fallback/runtime/runtime_fallback_op_handler.h"
-#include "tensorflow/core/runtime_fallback/runtime/runtime_fallback_tensor.h"
+#include "tensorflow/core/tfrt/runtime/work_queue_interface.h"
 #include "tfrt/cpu/core_runtime/cpu_op_handler.h"  // from @tf_runtime
-#include "tfrt/cpu/core_runtime/null_op_handler.h"  // from @tf_runtime
-#include "tfrt/core_runtime/logging_op_handler.h"  // from @tf_runtime
+#include "tfrt/core_runtime/core_runtime.h"  // from @tf_runtime
 #include "tfrt/host_context/concurrent_work_queue.h"  // from @tf_runtime
+#include "tfrt/host_context/diagnostic.h"  // from @tf_runtime
 #include "tfrt/host_context/host_allocator.h"  // from @tf_runtime
 #include "tfrt/tensor/scalar_host_tensor.h"  // from @tf_runtime
-
-#ifdef GOOGLE_CUDA
-#include "tfrt/gpu/core_runtime/gpu_op_handler.h"  // from @tf_runtime
-#include "tfrt/gpu/device/device.h"  // from @tf_runtime
-#include "tfrt/gpu/device/device_util.h"  // from @tf_runtime
-#include "tfrt/gpu/tensor/dense_gpu_tensor.h"  // from @tf_runtime
-#endif  // GOOGLE_CUDA
 
 constexpr char const kDefaultHostDeviceName[] =
     "/job:localhost/replica:0/task:0/device:CPU:0";
 
-// TODO(chky): Move these flags to test-only targets.
-// TODO(chky): Use tensorflow::Flags instead of absl::Flag when moving to
-// OSS.
-ABSL_FLAG(std::string, tfrt_default_device, kDefaultHostDeviceName,
-          "The default device name.");
-ABSL_FLAG(bool, tfrt_enable_sync_logging, false,
-          "Print debug log produced by sync_logging device.");
-ABSL_FLAG(bool, tfrt_enable_fallback, true, "enable runtime fallback.");
-ABSL_FLAG(int, tfrt_num_threads, 0,
-          "The number of compute threads. If non-positive, the system will "
-          "choose an appropriate number.");
-ABSL_FLAG(int, tfrt_num_blocking_threads, 16,
-          "The number of threads for blocking work.");
-
 namespace tensorflow {
 namespace tfrt_stub {
 namespace {
-
-tensorflow::Status InitializeOpHandlers(tfrt::CoreRuntime* corert) {
-  std::string default_device = absl::GetFlag(FLAGS_tfrt_default_device);
-  bool enable_sync_logging = absl::GetFlag(FLAGS_tfrt_enable_sync_logging);
-  bool enable_fallback = absl::GetFlag(FLAGS_tfrt_enable_fallback);
-
-  DeviceNameUtils::ParsedName device_parsed_name;
-  if (!DeviceNameUtils::ParseFullName(default_device, &device_parsed_name) ||
-      !device_parsed_name.has_type) {
-    return tensorflow::Status(tensorflow::error::INVALID_ARGUMENT,
-                              "Invalid device name");
-  }
-
-  if (device_parsed_name.type == DEVICE_CPU) {
-    default_device = kDefaultHostDeviceName;
-  } else if (device_parsed_name.type == DEVICE_GPU &&
-             (!device_parsed_name.has_job || !device_parsed_name.has_id ||
-              !device_parsed_name.has_replica ||
-              !device_parsed_name.has_task)) {
-    return tensorflow::Status(tensorflow::error::INVALID_ARGUMENT,
-                              "Device name must be fully specified");
-  }
-
-  tfrt::OpHandler* op_handler = nullptr;
-
-  if (enable_fallback) {
-    if (device_parsed_name.type == DEVICE_GPU) {
-#ifdef GOOGLE_CUDA
-      auto fallback_op_handler =
-          tensorflow::tfd::CreateRuntimeFallbackOpHandler(
-              corert, /*tf_device_name=*/"");
-      corert->RegisterOpHandler("tf", fallback_op_handler.get());
-      op_handler = fallback_op_handler.get();
-#endif  // GOOGLE_CUDA
-    } else {
-      auto fallback_op_handler = tensorflow::tfd::CreateKernelFallbackOpHandler(
-          corert, corert->GetHostContext()->GetHostDeviceRef());
-      corert->RegisterOpHandler("tfkernel", fallback_op_handler.get());
-      op_handler = fallback_op_handler.get();
-    }
-  } else {
-    auto null_op_handler = tfrt::CreateNullOpHandler(corert);
-    op_handler = null_op_handler.get();
-  }
-
-  if (device_parsed_name.type == DEVICE_CPU) {
-    auto cpu_device = corert->GetHostContext()->GetHostDeviceRef();
-    auto cpu_op_handler =
-        tfrt::CreateCpuOpHandler(corert, std::move(cpu_device), op_handler);
-
-    cpu_op_handler.get()->AddImplicitConversion(
-        tensorflow::tfd::RuntimeFallbackTensor::kTensorType,
-        tfrt::DenseHostTensor::kTensorType);
-    cpu_op_handler.get()->AddImplicitConversion(
-        tensorflow::tfd::RuntimeFallbackTensor::kTensorType,
-        tfrt::AnyScalarHostTensor::kTensorType);
-    cpu_op_handler.get()->AddImplicitConversion(
-        tensorflow::tfd::RuntimeFallbackTensor::kTensorType,
-        tfrt::StringHostTensor::kTensorType);
-    cpu_op_handler.get()->AddImplicitConversion(
-        tensorflow::KernelFallbackTensor::kTensorType,
-        tfrt::DenseHostTensor::kTensorType);
-    cpu_op_handler.get()->AddImplicitConversion(
-        tensorflow::KernelFallbackTensor::kTensorType,
-        tfrt::AnyScalarHostTensor::kTensorType);
-    cpu_op_handler.get()->AddImplicitConversion(
-        tensorflow::KernelFallbackTensor::kTensorType,
-        tfrt::StringHostTensor::kTensorType);
-
-    op_handler = cpu_op_handler.get();
-#ifdef GOOGLE_CUDA
-  } else if (device_parsed_name.type == DEVICE_GPU) {
-    const int gpu_ordinal = 0;
-    auto gpu_device = tfrt::gpu::GetOrCreateGpuDevice(
-        default_device, gpu_ordinal, corert->GetHostContext());
-    auto gpu_op_handler = tfrt::gpu::CreateGpuOpHandler(
-        corert, std::move(gpu_device.get()), op_handler);
-    op_handler = gpu_op_handler.get();
-#endif  // GOOGLE_CUDA
-  } else {
-    return tensorflow::Status(tensorflow::error::INVALID_ARGUMENT,
-                              "Unknown device type");
-  }
-
-  if (enable_sync_logging) {
-    auto logging_op_handler = tfrt::CreateLoggingOpHandler(
-        corert, op_handler, /*sync_log_results=*/true);
-    op_handler = logging_op_handler.get();
-  }
-
-  corert->RegisterOpHandler(default_device, op_handler);
-
-  return tensorflow::Status::OK();
+Runtime** GetGlobalRuntimeInternal() {
+  static Runtime* tfrt_runtime = nullptr;
+  return &tfrt_runtime;
 }
-
 }  // namespace
 
+void Runtime::LogOnError(const tfrt::DecodedDiagnostic& diag) {
+  LOG(ERROR) << diag.message();
+}
+
 std::unique_ptr<Runtime> Runtime::Create(
-    std::unique_ptr<WorkQueueInterface> work_queue) {
+    std::unique_ptr<WorkQueueInterface> work_queue,
+    std::function<void(const tfrt::DecodedDiagnostic&)> diag_handler) {
   auto* work_queue_ptr = work_queue.get();
-  auto expected_core_runtime = tfrt::CoreRuntime::Create(
-      [](const tfrt::DecodedDiagnostic& diag) { LOG(ERROR) << diag.message; },
-      tfrt::CreateMallocAllocator(), std::move(work_queue),
-      kDefaultHostDeviceName);
+  auto expected_core_runtime =
+      tfrt::CoreRuntime::Create(diag_handler, tfrt::CreateMallocAllocator(),
+                                std::move(work_queue), kDefaultHostDeviceName);
   DCHECK(expected_core_runtime);
-  const auto& status = InitializeOpHandlers(expected_core_runtime.get().get());
-  if (!status.ok()) {
-    LOG(ERROR) << "Failed to initialize op handlers: " << status;
-    return {};
-  }
 
   // We don't use std::make_unique here because the constructor should better be
   // private.
@@ -175,12 +63,13 @@ std::unique_ptr<Runtime> Runtime::Create(
       new Runtime(std::move(expected_core_runtime.get()), work_queue_ptr));
 }
 
-std::unique_ptr<Runtime> Runtime::Create() {
-  int num_threads = absl::GetFlag(FLAGS_tfrt_num_threads);
-  if (num_threads <= 0) num_threads = tensorflow::port::MaxParallelism();
+std::unique_ptr<Runtime> Runtime::Create(int num_inter_op_threads,
+                                         int num_intra_op_threads) {
+  if (num_intra_op_threads <= 0)
+    num_intra_op_threads = tensorflow::port::MaxParallelism();
   return Runtime::Create(
       WrapDefaultWorkQueue(tfrt::CreateMultiThreadedWorkQueue(
-          num_threads, absl::GetFlag(FLAGS_tfrt_num_blocking_threads))));
+          num_intra_op_threads, num_inter_op_threads)));
 }
 
 Runtime::Runtime(std::unique_ptr<tfrt::CoreRuntime> core_runtime,
@@ -191,5 +80,14 @@ Runtime::Runtime(std::unique_ptr<tfrt::CoreRuntime> core_runtime,
 
 Runtime::~Runtime() = default;
 
+Runtime* GetGlobalRuntime() { return *GetGlobalRuntimeInternal(); }
+
+void SetGlobalRuntime(std::unique_ptr<Runtime> runtime) {
+  Runtime** global_runtime_ptr = GetGlobalRuntimeInternal();
+  if (*global_runtime_ptr) {
+    delete *global_runtime_ptr;
+  }
+  *global_runtime_ptr = runtime.release();
+}
 }  // namespace tfrt_stub
 }  // namespace tensorflow

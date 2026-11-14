@@ -17,7 +17,7 @@ limitations under the License.
 #define TENSORFLOW_CORE_FRAMEWORK_TENSOR_SLICE_H_
 
 #include <string>
-#include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
+#include "unsupported/Eigen/CXX11/Tensor"  // from @eigen_archive
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/tensor_slice.pb.h"
 #include "tensorflow/core/lib/core/status.h"
@@ -48,10 +48,16 @@ class TensorSlice {
   explicit TensorSlice(
       std::initializer_list<std::pair<int64_t, int64_t>> extents);
 
-  static Status Parse(const string& str, TensorSlice* output);
-  static TensorSlice ParseOrDie(const string& str) {
+  // This factory methods should be used instead of the constructor that takes a
+  // `TensorSliceProto` if calling code cannot validate that the sizes specify a
+  // valid `TensorSlice`.
+  static absl::Status BuildTensorSlice(const TensorSliceProto& proto,
+                                       TensorSlice* output);
+
+  static absl::Status Parse(const std::string& str, TensorSlice* output);
+  static TensorSlice ParseOrDie(const std::string& str) {
     TensorSlice ret;
-    Status s = Parse(str, &ret);
+    absl::Status s = Parse(str, &ret);
     if (!s.ok()) {
       LOG(FATAL) << "Could not parse TensorSlice";
     }
@@ -111,7 +117,7 @@ class TensorSlice {
 
   // Conversion of a TensorSlice to other formats
   void AsProto(TensorSliceProto* proto) const;
-  string DebugString() const;
+  std::string DebugString() const;
 
   // Fill *indices and *sizes from *this (so that we can use the slice()
   // function in eigen tensor). We need a tensor shape in case some of the
@@ -145,8 +151,8 @@ class TensorSlice {
   // Requires that the shape and *this have the same rank.
   // For example, given a tensor shape of {3, 4, 5}, and a slice of
   // 1,2:-:0,2, the result shape is {2, 4, 2}.
-  Status SliceTensorShape(const TensorShape& shape,
-                          TensorShape* result_shape) const;
+  absl::Status SliceTensorShape(const TensorShape& shape,
+                                TensorShape* result_shape) const;
 
   // Given slice "sub" where "sub" is fully contained in *this,
   // (meaning that the intersection of "sub" and *this equals "sub"), computes
@@ -192,8 +198,8 @@ class TensorSlice {
 
   // TODO(yangke): switch to Eigen once it supports variable size arrays.
   // A value of
-  gtl::InlinedVector<int64_t, 4> starts_;
-  gtl::InlinedVector<int64_t, 4> lengths_;
+  absl::InlinedVector<int64_t, 4UL> starts_;
+  absl::InlinedVector<int64_t, 4UL> lengths_;
 };
 
 template <int NDIMS>

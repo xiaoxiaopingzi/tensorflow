@@ -14,69 +14,52 @@ limitations under the License.
 ==============================================================================*/
 #include "tensorflow/core/tfrt/runtime/work_queue_interface.h"
 
-#include "tensorflow/core/platform/context.h"
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+
+#include "absl/status/statusor.h"
+#include "tfrt/host_context/execution_context.h"  // from @tf_runtime
 
 namespace tensorflow {
 namespace tfrt_stub {
 namespace {
 
-class DefaultWorkQueueWrapper final : public WorkQueueInterface {
+class DefaultWorkQueueWrapper : public WorkQueueInterface {
  public:
   explicit DefaultWorkQueueWrapper(
       std::unique_ptr<tfrt::ConcurrentWorkQueue> work_queue)
-      : work_queue_(std::move(work_queue)) {}
+      : WorkQueueInterface(/*id=*/0),
+        work_queue_owner_(std::move(work_queue)),
+        work_queue_(work_queue_owner_.get()) {}
+
+  DefaultWorkQueueWrapper(std::unique_ptr<tfrt::ConcurrentWorkQueue> work_queue,
+                          thread::ThreadPoolInterface* intra_thread_pool)
+      : WorkQueueInterface(/*id=*/0, intra_thread_pool),
+        work_queue_owner_(std::move(work_queue)),
+        work_queue_(work_queue_owner_.get()) {}
+
+  DefaultWorkQueueWrapper(int64_t request_id,
+                          tfrt::ConcurrentWorkQueue* work_queue,
+                          thread::ThreadPoolInterface* intra_thread_pool)
+      : WorkQueueInterface(request_id, intra_thread_pool),
+        work_queue_(work_queue) {}
+
   ~DefaultWorkQueueWrapper() override = default;
 
  private:
   std::string name() const override { return work_queue_->name(); }
 
   void AddTask(tfrt::TaskFunction work) override {
-    tensorflow::Context context(tensorflow::ContextKind::kThread);
-    tfrt::TaskFunction wrapped_work(
-        [context = std::move(context), work = std::move(work)]() mutable {
-          tensorflow::WithContext wc(context);
-          work();
-        });
-
-    work_queue_->AddTask(std::move(wrapped_work));
+    work_queue_->AddTask(WrapWork(id(), "inter", std::move(work)));
   }
 
-  void AddTask(const tfrt::ExecutionContext& exec_ctx,
-               tfrt::TaskFunction work) override {
-    tensorflow::Context context(tensorflow::ContextKind::kThread);
-    tfrt::TaskFunction wrapped_work(
-        [context = std::move(context), work = std::move(work)]() mutable {
-          tensorflow::WithContext wc(context);
-          work();
-        });
-
-    work_queue_->AddTask(exec_ctx, std::move(wrapped_work));
-  }
-
-  llvm::Optional<tfrt::TaskFunction> AddBlockingTask(
+  std::optional<tfrt::TaskFunction> AddBlockingTask(
       tfrt::TaskFunction work, bool allow_queuing) override {
-    tensorflow::Context context(tensorflow::ContextKind::kThread);
-    tfrt::TaskFunction wrapped_work(
-        [context = std::move(context), work = std::move(work)]() mutable {
-          tensorflow::WithContext wc(context);
-          work();
-        });
-
-    return work_queue_->AddBlockingTask(std::move(wrapped_work), allow_queuing);
-  }
-
-  llvm::Optional<tfrt::TaskFunction> AddBlockingTask(
-      const tfrt::ExecutionContext& exec_ctx, tfrt::TaskFunction work,
-      bool allow_queuing) override {
-    tensorflow::Context context(tensorflow::ContextKind::kThread);
-    tfrt::TaskFunction wrapped_work(
-        [context = std::move(context), work = std::move(work)]() mutable {
-          tensorflow::WithContext wc(context);
-          work();
-        });
-
-    return work_queue_->AddBlockingTask(exec_ctx, std::move(wrapped_work),
-                                        allow_queuing);
+    return work_queue_->AddBlockingTask(
+        WrapWork(id(), "blocking", std::move(work)), allow_queuing);
   }
 
   void Await(
@@ -94,8 +77,19 @@ class DefaultWorkQueueWrapper final : public WorkQueueInterface {
     return work_queue_->IsInWorkerThread();
   }
 
+  absl::StatusOr<std::unique_ptr<WorkQueueInterface>> InitializeRequest(
+      int64_t request_id, int priority) const override {
+    return {std::make_unique<DefaultWorkQueueWrapper>(request_id, work_queue_,
+                                                      GetIntraOpThreadPool())};
+  }
+
  private:
-  std::unique_ptr<tfrt::ConcurrentWorkQueue> work_queue_;
+  // Optionally the wrapper can own a work queue. In that case, it is stored in
+  // `work_queue_owner_`.
+  std::unique_ptr<tfrt::ConcurrentWorkQueue> work_queue_owner_;
+  // The non-owning pointer to the underlying work queue. If `work_queue_owner_`
+  // is not nullptr, then `work_queue_` is the same as `work_queue_owner_`.
+  tfrt::ConcurrentWorkQueue* work_queue_ = nullptr;
 };
 
 }  // namespace
@@ -103,6 +97,13 @@ class DefaultWorkQueueWrapper final : public WorkQueueInterface {
 std::unique_ptr<WorkQueueInterface> WrapDefaultWorkQueue(
     std::unique_ptr<tfrt::ConcurrentWorkQueue> work_queue) {
   return std::make_unique<DefaultWorkQueueWrapper>(std::move(work_queue));
+}
+
+std::unique_ptr<WorkQueueInterface> WrapDefaultWorkQueue(
+    std::unique_ptr<tfrt::ConcurrentWorkQueue> work_queue,
+    thread::ThreadPoolInterface* intra_thread_pool) {
+  return std::make_unique<DefaultWorkQueueWrapper>(std::move(work_queue),
+                                                   intra_thread_pool);
 }
 
 }  // namespace tfrt_stub

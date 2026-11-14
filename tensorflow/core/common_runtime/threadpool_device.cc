@@ -41,9 +41,9 @@ info. It does not have any negative impact on performance. */
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/graph/types.h"
 #include "tensorflow/core/lib/hash/hash.h"
-#include "tensorflow/core/platform/tracing.h"
 #include "tensorflow/core/platform/types.h"
 #include "tensorflow/core/public/session_options.h"
+#include "tensorflow/core/util/port.h"
 #include "tensorflow/core/util/util.h"
 
 #ifdef INTEL_MKL
@@ -54,13 +54,24 @@ info. It does not have any negative impact on performance. */
 namespace tensorflow {
 
 ThreadPoolDevice::ThreadPoolDevice(const SessionOptions& options,
-                                   const string& name, Bytes memory_limit,
+                                   const std::string& name, Bytes memory_limit,
                                    const DeviceLocality& locality,
                                    Allocator* allocator)
     : LocalDevice(options, Device::BuildDeviceAttributes(
                                name, DEVICE_CPU, memory_limit, locality)),
       allocator_(allocator),
       scoped_allocator_mgr_(new ScopedAllocatorMgr(name)) {
+  auto s = NodeFileWriter::GetNodeFileWriterIfEnabled(name, env());
+  if (!s.ok()) {
+    LOG(ERROR) << s.status();
+  } else {
+    node_file_writer_ = *s;
+    if (node_file_writer_) {
+      LOG(INFO) << "Writing NodeDefs to file: "
+                << node_file_writer_->filename();
+    }
+  }
+
 #if defined(ENABLE_ONEDNN_OPENMP) && defined(INTEL_MKL)
   // Early return when MKL is disabled
   if (!IsMKLEnabled()) return;
@@ -90,7 +101,7 @@ ThreadPoolDevice::ThreadPoolDevice(const SessionOptions& options,
 #endif  // defined(ENABLE_ONEDNN_OPENMP) && defined(INTEL_MKL)
 }
 
-ThreadPoolDevice::~ThreadPoolDevice() {}
+ThreadPoolDevice::~ThreadPoolDevice() = default;
 
 Allocator* ThreadPoolDevice::GetAllocator(AllocatorAttributes attr) {
   return allocator_;
@@ -107,18 +118,18 @@ Allocator* ThreadPoolDevice::GetScopedAllocator(AllocatorAttributes attr,
   return allocator_;
 }
 
-Status ThreadPoolDevice::MakeTensorFromProto(
+absl::Status ThreadPoolDevice::MakeTensorFromProto(
     const TensorProto& tensor_proto, const AllocatorAttributes alloc_attrs,
     Tensor* tensor) {
   if (tensor_proto.dtype() > 0 && tensor_proto.dtype() <= DataType_MAX) {
     Tensor parsed(tensor_proto.dtype());
     if (parsed.FromProto(allocator_, tensor_proto)) {
       *tensor = std::move(parsed);
-      return Status::OK();
+      return absl::OkStatus();
     }
   }
-  return errors::InvalidArgument("Cannot parse tensor from proto: ",
-                                 tensor_proto.DebugString());
+  return absl::InvalidArgumentError(absl::StrCat(
+      "Cannot parse tensor from proto: ", tensor_proto.DebugString()));
 }
 
 void ThreadPoolDevice::CopyTensorInSameDevice(
@@ -131,7 +142,7 @@ void ThreadPoolDevice::CopyTensorInSameDevice(
     return;
   }
   tensor::DeepCopy(*input_tensor, output_tensor);
-  done(Status::OK());
+  done(absl::OkStatus());
 }
 
 namespace {
@@ -155,6 +166,10 @@ const absl::flat_hash_set<std::string>* GetOpsToLogFromEnv() {
 bool ShouldLogInputsAndOutputs(OpKernel* op_kernel) {
   static const absl::flat_hash_set<std::string>& ops_to_log =
       *GetOpsToLogFromEnv();
+  static const bool is_empty = ops_to_log.empty();
+  if (is_empty) {
+    return false;
+  }
   return ops_to_log.count(op_kernel->type_string());
 }
 }  // namespace
@@ -167,6 +182,14 @@ void ThreadPoolDevice::Compute(OpKernel* op_kernel, OpKernelContext* context) {
   }
 
   op_kernel->Compute(context);
+
+  if (context->status().ok() && node_file_writer_) {
+    absl::Status s = node_file_writer_->RecordNodeExecution(op_kernel, context);
+    if (!s.ok()) {
+      LOG(ERROR) << s;
+      context->SetStatus(s);
+    }
+  }
 
   if (should_log_inputs_and_outputs) {
     LogOutputs(op_kernel, context);
@@ -209,7 +232,7 @@ void ThreadPoolDevice::LogOutputs(OpKernel* op_kernel,
                                   OpKernelContext* context) {
   if (!context->status().ok()) {
     LOG(INFO) << op_kernel->name()
-              << " failed: " << context->status().error_message();
+              << " failed: " << context->status().message();
     return;
   }
 
@@ -241,7 +264,10 @@ class MklCPUAllocatorFactory : public AllocatorFactory {
   }
 };
 
-REGISTER_MEM_ALLOCATOR("MklCPUAllocator", (IsMKLEnabled() ? 200 : 50),
+// Performance is better with MklCPUAllocator. Hence, enabling it for ZenDNN
+// as well.
+REGISTER_MEM_ALLOCATOR("MklCPUAllocator",
+                       ((IsMKLEnabled() || IsZenDnnEnabled()) ? 200 : 50),
                        MklCPUAllocatorFactory);
 
 }  // namespace

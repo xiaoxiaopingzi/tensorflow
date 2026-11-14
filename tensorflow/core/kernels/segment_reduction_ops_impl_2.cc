@@ -18,6 +18,14 @@ limitations under the License.
 
 namespace tensorflow {
 
+template <typename T>
+using MinReducerPropagateNaN =
+    Eigen::internal::MinReducer<T, Eigen::PropagateNaN>;
+
+template <typename T>
+using MaxReducerPropagateNaN =
+    Eigen::internal::MaxReducer<T, Eigen::PropagateNaN>;
+
 #define REGISTER_CPU_KERNEL_SEGMENT(name, functor, type, index_type, \
                                     default_value)                   \
   REGISTER_KERNEL_BUILDER(                                           \
@@ -34,9 +42,9 @@ namespace tensorflow {
       "SegmentMean", Eigen::internal::MeanReducer<type>, type, index_type, 0); \
   REGISTER_CPU_KERNEL_SEGMENT(                                                 \
       "SegmentProd", Eigen::internal::ProdReducer<type>, type, index_type, 1); \
-  REGISTER_CPU_KERNEL_SEGMENT("SegmentMin", Eigen::internal::MinReducer<type>, \
+  REGISTER_CPU_KERNEL_SEGMENT("SegmentMin", MinReducerPropagateNaN<type>,      \
                               type, index_type, 0);                            \
-  REGISTER_CPU_KERNEL_SEGMENT("SegmentMax", Eigen::internal::MaxReducer<type>, \
+  REGISTER_CPU_KERNEL_SEGMENT("SegmentMax", MaxReducerPropagateNaN<type>,      \
                               type, index_type, 0)
 
 #define REGISTER_COMPLEX_CPU_KERNELS(type, index_type)                         \
@@ -63,33 +71,37 @@ REGISTER_COMPLEX_CPU_KERNELS_ALL(complex128);
 #undef REGISTER_COMPLEX_CPU_KERNELS_ALL
 
 #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
-#define REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                   \
-    name, type, index_type, initial_value_functor, reduction_kernel_functor, \
-    atomic_reduction_kernel_functor)                                         \
-  REGISTER_KERNEL_BUILDER(                                                   \
-      Name(name)                                                             \
-          .Device(DEVICE_GPU)                                                \
-          .TypeConstraint<type>("T")                                         \
-          .TypeConstraint<index_type>("Tindices"),                           \
-      SegmentReductionGPUOp<                                                 \
-          type, index_type,                                                  \
-          functor::SegmentReductionFunctor<                                  \
-              type, index_type, initial_value_functor,                       \
-              reduction_kernel_functor, atomic_reduction_kernel_functor> >)
+#define REGISTER_GPU_KERNEL_SORTEDSEGMENT(                            \
+    name, type, index_type, initial_value_functor,                    \
+    empty_segment_value_functor, reduction_kernel_functor, is_mean)   \
+  REGISTER_KERNEL_BUILDER(                                            \
+      Name(name)                                                      \
+          .Device(DEVICE_GPU)                                         \
+          .TypeConstraint<type>("T")                                  \
+          .TypeConstraint<index_type>("Tindices"),                    \
+      SegmentReductionGPUOp<                                          \
+          type, index_type,                                           \
+          functor::SegmentReductionFunctor<                           \
+              type, index_type, initial_value_functor,                \
+              empty_segment_value_functor, reduction_kernel_functor>, \
+          is_mean>)
 
-#define REGISTER_GPU_SORTED_KERNELS(type, index_type)                     \
-  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                      \
-      "SegmentSum", type, index_type, functor::Zero<type>,                \
-      functor::NonAtomicSumOpGpu<type>, functor::AtomicSumOpGpu<type>);   \
-  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                      \
-      "SegmentProd", type, index_type, functor::One<type>,                \
-      functor::NonAtomicProdOpGpu<type>, functor::AtomicProdOpGpu<type>); \
-  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                      \
-      "SegmentMin", type, index_type, functor::Highest<type>,             \
-      functor::NonAtomicMinOpGpu<type>, functor::AtomicMinOpGpu<type>);   \
-  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                      \
-      "SegmentMax", type, index_type, functor::Lowest<type>,              \
-      functor::NonAtomicMaxOpGpu<type>, functor::AtomicMaxOpGpu<type>);
+#define REGISTER_GPU_SORTED_KERNELS(type, index_type)                         \
+  REGISTER_GPU_KERNEL_SORTEDSEGMENT("SegmentSum", type, index_type,           \
+                                    functor::Zero<type>, functor::Zero<type>, \
+                                    functor::Sum, /*is_mean=*/false);         \
+  REGISTER_GPU_KERNEL_SORTEDSEGMENT("SegmentMean", type, index_type,          \
+                                    functor::Zero<type>, functor::Zero<type>, \
+                                    functor::Sum, /*is_mean=*/true);          \
+  REGISTER_GPU_KERNEL_SORTEDSEGMENT("SegmentProd", type, index_type,          \
+                                    functor::One<type>, functor::One<type>,   \
+                                    functor::Prod, /*is_mean=*/false);        \
+  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                          \
+      "SegmentMin", type, index_type, functor::Highest<type>,                 \
+      functor::Zero<type>, functor::Min, /*is_mean=*/false);                  \
+  REGISTER_GPU_KERNEL_SORTEDSEGMENT(                                          \
+      "SegmentMax", type, index_type, functor::Lowest<type>,                  \
+      functor::Zero<type>, functor::Max, /*is_mean=*/false);
 
 #define REGISTER_GPU_SORTED_KERNELS_ALL(type) \
   REGISTER_GPU_SORTED_KERNELS(type, int64_t);

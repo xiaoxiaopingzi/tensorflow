@@ -17,6 +17,12 @@ limitations under the License.
 
 #include "tensorflow/core/runtime_fallback/runtime/runtime_fallback_tensor.h"
 
+#include <cassert>
+#include <cstdint>
+#include <memory>
+#include <utility>
+
+#include "absl/status/status.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include "tensorflow/c/tensor_interface.h"
@@ -49,7 +55,6 @@ using tfrt::HostBuffer;
 using tfrt::HostContext;
 using tfrt::RCReference;
 using tfrt::StringHostTensor;
-using tfrt::Tensor;
 using tfrt::TensorMetadata;
 using tfrt::TensorShape;
 
@@ -63,9 +68,9 @@ RuntimeFallbackTensor::RuntimeFallbackTensor(const TensorShape& shape,
   assert(IsValid(dtype) && "Invalid dtype");
 }
 
-llvm::SmallVector<ssize_t, 4> GetShape(
+llvm::SmallVector<tfrt::Index, 4> GetShape(
     AbstractTensorInterface* tensor_interface) {
-  llvm::SmallVector<ssize_t, 4> dims;
+  llvm::SmallVector<tfrt::Index, 4> dims;
   int64_t num_dims = tensor_interface->NumDims();
   dims.reserve(num_dims);
   for (int i = 0; i < num_dims; ++i) {
@@ -98,14 +103,14 @@ Expected<StringHostTensor> CopyTfStringTensorToStringHostTensor(
 // TODO(jingdong): Format the tensor in more user-friendly format, especially
 // for large tensors. See tensorflow::Tensor::DebugString().
 void RuntimeFallbackTensor::Print(tfrt::raw_ostream& os) const {
-  tensorflow::Status status;
+  absl::Status status;
   OwnedAbstractTensorInterface tensor_interface{
       tensor_handle_->Resolve(&status)};
   assert(status.ok());
 
   int rank = tensor_interface->NumDims();
 
-  llvm::SmallVector<ssize_t, 4> dims;
+  llvm::SmallVector<tfrt::Index, 4> dims;
   for (auto i = 0; i < rank; ++i) {
     dims.push_back(tensor_interface->Dim(i));
   }
@@ -147,19 +152,19 @@ tfrt::Expected<RuntimeFallbackTensor>
 CreateRuntimeFallbackTensorFromTfTensorHandle(OwnedTensorHandle owned_th,
                                               HostContext* host) {
   int rank;
-  tensorflow::Status status = owned_th->NumDims(&rank);
+  absl::Status status = owned_th->NumDims(&rank);
   if (!status.ok())
     return tfrt::MakeStringError(tfrt::StrCat(
-        "error getting rank from TF tensor handle: ", status.error_message()));
+        "error getting rank from TF tensor handle: ", status.message()));
 
-  llvm::SmallVector<ssize_t, 4> dims;
+  llvm::SmallVector<tfrt::Index, 4> dims;
   for (auto i = 0; i < rank; ++i) {
     int64_t dim;
     status = owned_th->Dim(i, &dim);
     if (!status.ok())
       return tfrt::MakeStringError(
           tfrt::StrCat("error getting dimension from TFE tensor handle: ",
-                       status.error_message()));
+                       status.message()));
     dims.push_back(dim);
   }
 
@@ -186,7 +191,7 @@ RuntimeFallbackTensor MoveDHTToRuntimeFallbackTensor(DenseHostTensor&& dht,
 RuntimeFallbackTensor CopyRefDHTToRuntimeFallbackTensor(
     const DenseHostTensor& dht, HostContext* host) {
   // Do not copy the host buffer, TF_NewTensor simply CopyRef.
-  RCReference<HostBuffer> host_buffer = dht.buffer().CopyRef();
+  RCReference<HostBuffer> host_buffer = dht.buffer();
   tensorflow::Tensor tensor = MoveHostBufferToTfTensor(
       std::move(host_buffer), dht.dtype(), dht.shape());
 

@@ -38,12 +38,12 @@ limitations under the License.
 #define EIGEN_USE_GPU
 #endif  // GOOGLE_CUDA
 
+#include <limits>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
-#include "absl/strings/str_cat.h"
-#include "absl/strings/str_join.h"
-#include "absl/strings/substitute.h"
 #include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
@@ -59,19 +59,17 @@ limitations under the License.
 
 #if GOOGLE_CUDA
 #include "third_party/gpus/cudnn/cudnn.h"
+#include "xla/stream_executor/gpu/gpu_asm_opts.h"
+#include "xla/stream_executor/gpu/redzone_allocator.h"
+#include "xla/stream_executor/integrations/tf_allocator_adapter.h"
 #include "tensorflow/core/kernels/conv_ops_gpu.h"
 #include "tensorflow/core/platform/stream_executor.h"
 #include "tensorflow/core/util/autotune_maps/conv_autotune_maps.h"
 #include "tensorflow/core/util/autotune_maps/conv_parameters.h"
 #include "tensorflow/core/util/proto/proto_utils.h"
-#include "tensorflow/stream_executor/gpu/gpu_asm_opts.h"
-#include "tensorflow/stream_executor/gpu/redzone_allocator.h"
-#include "tensorflow/stream_executor/tf_allocator_adapter.h"
 #endif  // GOOGLE_CUDA
 
 namespace tensorflow {
-
-class AutotuneResult;
 
 typedef Eigen::ThreadPoolDevice CPUDevice;
 typedef Eigen::GpuDevice GPUDevice;
@@ -215,12 +213,17 @@ struct LaunchFusedConv2DOp<CPUDevice, T> {
                   const FusedComputationArgs& fusion_args,
                   const Conv2DParameters& params,
                   const Conv2DDimensions& dimensions, Tensor* output) {
-    OP_REQUIRES(context, dimensions.in_depth == filter.dim_size(2),
-                errors::Unimplemented("Fused conv implementation does not "
-                                      "support grouped convolutions for now."));
-    OP_REQUIRES(context, params.data_format == FORMAT_NHWC,
-                errors::Unimplemented("Fused conv implementation only supports "
-                                      "NHWC tensor format for now."));
+    OP_REQUIRES(
+        context, dimensions.in_depth == filter.dim_size(2),
+        absl::UnimplementedError("Fused conv implementation does not "
+                                 "support grouped convolutions for now."));
+    OP_REQUIRES(
+        context, params.data_format == FORMAT_NHWC,
+        absl::UnimplementedError("Fused conv implementation only supports "
+                                 "NHWC tensor format for now."));
+    OP_REQUIRES(context, DataTypeToEnum<T>::value != DT_HALF,
+                absl::UnimplementedError("Fused conv implementation with half "
+                                         "precision is not supported on CPU."));
 
     BiasAddArgs<T> bias_add_args;
     if (BiasAddArgs<T>::IsSupported(fusion)) {
@@ -253,7 +256,8 @@ struct LaunchFusedConv2DOp<CPUDevice, T> {
 
     switch (fusion) {
       case FusedComputationType::kUndefined:
-        OP_REQUIRES_OK(context, errors::Internal("Fusion type is undefined"));
+        OP_REQUIRES_OK(context,
+                       absl::InternalError("Fusion type is undefined"));
         break;
       case FusedComputationType::kBiasAdd:
         conv2d(WithBiasAdd<T>(bias_add_args), context, input, filter, output);
@@ -299,9 +303,19 @@ struct LaunchFusedConv2DOp<CPUDevice, T> {
                                            fused_batch_norm_args),
                context, input, filter, output);
         break;
+      default:
+        OP_REQUIRES_OK(context,
+                       absl::InternalError("Fusion type is unsupported"));
+        break;
     }
   }
 };
+
+template <>
+struct LaunchFusedConv2DOp<CPUDevice, int8_t>;
+
+template <>
+struct LaunchFusedConv2DOp<CPUDevice, qint8>;
 
 #if GOOGLE_CUDA
 
@@ -311,128 +325,6 @@ inline int64_t ConvolveScratchSize() {
       "TF_CUDNN_WORKSPACE_LIMIT_IN_MB", 1LL << 32  // 4GB
   );
   return convolve_scratch_size;
-}
-
-// Finds the best convolution algorithm for the given ConvLaunch (cuda
-// convolution on the stream) and parameters, by running all possible
-// algorithms and measuring execution time.
-// TODO(ezhulenev): Move it to conv_ops_gpu.h and share with conv_ops.cc.
-template <typename T, typename ConvLaunch, typename LogFunc>
-Status FindBestConvolveAlgorithm(
-    const ConvParameters& params, const se::dnn::BatchDescriptor& input_desc,
-    const se::dnn::FilterDescriptor& filter_desc,
-    const se::dnn::BatchDescriptor& bias_desc,
-    const se::dnn::BatchDescriptor& output_desc,
-    const se::dnn::ConvolutionDescriptor& conv_desc,
-    const se::dnn::ActivationMode activation_mode, double conv_input_scale,
-    double side_input_scale, const ConvLaunch launch, OpKernelContext* context,
-    se::Stream* stream, se::DeviceMemory<T> output_ptr, const LogFunc& log,
-    se::dnn::AlgorithmConfig* algorithm_config) {
-  // Check if we already have an algorithm selected for the given parameters.
-  if (AutotuneConv::GetInstance()->Find(params, algorithm_config)) {
-    return Status::OK();
-  }
-  profiler::ScopedAnnotation trace("cudnn_autotuning");
-
-  // Find all candidate algorithms or execution plans (for CuDNN frontend APIs).
-  std::vector<std::unique_ptr<se::dnn::ConvolveExecutionPlan>> plans;
-  std::vector<se::dnn::AlgorithmDesc> algorithms;
-  std::vector<se::dnn::AlgorithmConfig> configs;
-  if (CudnnUseFrontend()) {
-    if (!stream->parent()
-             ->GetFusedConvolveExecutionPlans(
-                 se::dnn::ConvolutionKind::FORWARD,
-                 se::dnn::ToDataType<T>::value, conv_input_scale,
-                 side_input_scale, stream, input_desc, filter_desc, bias_desc,
-                 output_desc, conv_desc, activation_mode, &plans)
-             .ok()) {
-      return errors::Unknown(
-          "Failed to get convolution plans. This is probably because cuDNN "
-          "failed to initialize, so try looking to see if a warning log "
-          "message was printed above.");
-    }
-    for (const auto& plan : plans) {
-      configs.push_back(se::dnn::AlgorithmConfig(
-          se::dnn::AlgorithmDesc{plan->getTag(), plan->get_raw_desc()},
-          plan->getWorkspaceSize()));
-    }
-  } else {
-    if (!stream->parent()->GetConvolveAlgorithms(&algorithms)) {
-      return errors::Unknown(
-          "Failed to get convolution algorithm. This is probably because cuDNN "
-          "failed to initialize, so try looking to see if a warning log "
-          "message was printed above.");
-    }
-    for (const auto& algorithm : algorithms) {
-      configs.push_back(se::dnn::AlgorithmConfig(algorithm));
-    }
-  }
-
-  se::TfAllocatorAdapter tf_allocator_adapter(
-      context->device()->GetAllocator({}), stream);
-  se::RedzoneAllocator rz_allocator(stream, &tf_allocator_adapter,
-                                    se::GpuAsmOpts());
-  se::DeviceMemory<T> output_ptr_rz(
-      WrapRedzoneBestEffort(&rz_allocator, output_ptr));
-
-  std::vector<tensorflow::AutotuneResult> results;
-  for (const auto& profile_config : configs) {
-    DnnScratchAllocator scratch_allocator(ConvolveScratchSize(), context);
-    se::RedzoneAllocator rz_scratch_allocator(
-        stream, &tf_allocator_adapter, se::GpuAsmOpts(),
-        /*memory_limit=*/ConvolveScratchSize());
-    se::ScratchAllocator* allocator_used =
-        !RedzoneCheckDisabled()
-            ? static_cast<se::ScratchAllocator*>(&rz_scratch_allocator)
-            : static_cast<se::ScratchAllocator*>(&scratch_allocator);
-    se::dnn::ProfileResult profile_result;
-
-    Status cudnn_launch_status =
-        launch(profile_config, allocator_used, output_ptr_rz, &profile_result);
-
-    if (cudnn_launch_status.ok() && profile_result.is_valid()) {
-      results.emplace_back();
-      auto& result = results.back();
-      if (CudnnUseFrontend()) {
-        result.mutable_cuda_conv_plan()->set_exec_plan_id(
-            profile_config.algorithm()->exec_plan_id());
-      } else {
-        result.mutable_conv()->set_algorithm(
-            profile_config.algorithm()->algo_id());
-        result.mutable_conv()->set_tensor_ops_enabled(
-            profile_config.algorithm()->tensor_ops_enabled());
-      }
-      result.set_scratch_bytes(
-          !RedzoneCheckDisabled()
-              ? rz_scratch_allocator.TotalAllocatedBytesExcludingRedzones()
-              : scratch_allocator.TotalByteSize());
-      *result.mutable_run_time() = proto_utils::ToDurationProto(
-          absl::Milliseconds(profile_result.elapsed_time_in_ms()));
-      CheckRedzones(rz_scratch_allocator, &result);
-      CheckRedzones(rz_allocator, &result);
-    } else if (CudnnUseFrontend()) {
-      // When CuDNN frontend APIs are used, we need to make sure the profiling
-      // results are one-to-one mapping with the "plans". So, we insert dummy
-      // results when the execution fails.
-      results.emplace_back();
-      auto& result = results.back();
-      result.mutable_failure()->set_kind(AutotuneResult::UNKNOWN);
-      result.mutable_failure()->set_msg(
-          absl::StrCat("Profiling failure on CUDNN engine: ",
-                       profile_config.algorithm()->exec_plan_id()));
-    }
-  }
-  // Only log on an AutotuneConv cache miss.
-  log(results);
-  if (CudnnUseFrontend()) {
-    TF_RETURN_IF_ERROR(
-        BestCudnnConvAlgorithm(results, &plans, algorithm_config));
-  } else {
-    TF_RETURN_IF_ERROR(
-        BestCudnnConvAlgorithm(results, nullptr, algorithm_config));
-  }
-  AutotuneConv::GetInstance()->Insert(params, *algorithm_config);
-  return Status::OK();
 }
 
 template <typename T>
@@ -446,20 +338,27 @@ struct LaunchFusedConv2DOp<GPUDevice, T> {
     OP_REQUIRES(
         context,
         params.data_format == FORMAT_NHWC || params.data_format == FORMAT_NCHW,
-        errors::Unimplemented("Fused conv implementation only supports "
-                              "NHWC and HCHW tensor formats for now."));
+        absl::UnimplementedError("Fused conv implementation only supports "
+                                 "NHWC and HCHW tensor formats for now."));
 
     auto* stream = context->op_device_context()->stream();
-    OP_REQUIRES(context, stream, errors::Internal("No GPU stream available."));
-    OP_REQUIRES(
-        context, use_cudnn,
-        errors::Unimplemented("FusedConv2D for GPU is not currently supported "
-                              "without cudnn"));
+    OP_REQUIRES(context, stream,
+                absl::InternalError("No GPU stream available."));
+    OP_REQUIRES(context, use_cudnn,
+                absl::UnimplementedError(
+                    "FusedConv2D for GPU is not currently supported "
+                    "without cudnn"));
 
-    OP_REQUIRES(
-        context, fusion == FusedComputationType::kBiasAddWithRelu,
-        errors::Unimplemented("FusedConv2D implementation only supports "
-                              "fusing with `BiasAdd + Relu` for now."));
+    bool is_supported_activation =
+        fusion == FusedComputationType::kBiasAddWithRelu ||
+        fusion == FusedComputationType::kBiasAddWithRelu6 ||
+        fusion == FusedComputationType::kBiasAddWithElu ||
+        fusion == FusedComputationType::kBiasAddWithLeakyRelu;
+    OP_REQUIRES(context, is_supported_activation,
+                absl::UnimplementedError(
+                    "FusedConv2D implementation only supports "
+                    "fusing with `BiasAdd + Relu|Relu6|Elu|LeakyRlue`"
+                    " for now."));
 
     Tensor input = input_param;
 
@@ -477,14 +376,24 @@ struct LaunchFusedConv2DOp<GPUDevice, T> {
     const int64_t out_cols = GetTensorDim(*output, params.data_format, 'W');
     const int64_t out_depths = GetTensorDim(*output, params.data_format, 'C');
 
-    // Bias of the following dimensions: [ output_depth ]
+    // Bias of the following dimensions: [ output_depth ] or [1, ..., 1,
+    // output_depth]
     const Tensor& bias = context->input(2);
-    OP_REQUIRES(context, bias.dims() == 1,
-                errors::InvalidArgument("bias must be 1-dimensional",
-                                        bias.shape().DebugString()));
-    OP_REQUIRES(context, bias.dim_size(0) == out_depths,
-                errors::InvalidArgument("bias depth must be equal to out depth",
-                                        bias.shape().DebugString()));
+    OP_REQUIRES(context, bias.dims() >= 1,
+                absl::InvalidArgumentError(
+                    absl::StrCat("bias must be at least 1-dimensional, got: ",
+                                 bias.shape().DebugString())));
+    for (int i = 0; i < bias.dims() - 1; ++i) {
+      OP_REQUIRES(context, bias.dim_size(i) == 1,
+                  absl::InvalidArgumentError(absl::StrCat(
+                      "For bias_dims > 1, all except the last dimension "
+                      "must be 1, got: ",
+                      bias.shape().DebugString())));
+    }
+    OP_REQUIRES(context, bias.dim_size(bias.dims() - 1) == out_depths,
+                absl::InvalidArgumentError(
+                    absl::StrCat("bias depth must be equal to out depth",
+                                 bias.shape().DebugString())));
 
     const int64_t common_padding_rows =
         std::min(dimensions.pad_rows_before, dimensions.pad_rows_after);
@@ -508,12 +417,14 @@ struct LaunchFusedConv2DOp<GPUDevice, T> {
           std::abs(dimensions.pad_cols_after - dimensions.pad_cols_before);
       const int64_t new_in_rows = in_rows + padding_rows_diff;
       const int64_t new_in_cols = in_cols + padding_cols_diff;
+      TensorShape transformed_input_shape;
       OP_REQUIRES_OK(context,
-                     context->allocate_temp(
-                         DataTypeToEnum<T>::value,
-                         ShapeFromFormat(params.data_format, in_batch,
-                                         new_in_rows, new_in_cols, in_depths),
-                         &transformed_input));
+                     ShapeFromFormatWithStatus(
+                         params.data_format, in_batch, new_in_rows, new_in_cols,
+                         in_depths, &transformed_input_shape));
+      OP_REQUIRES_OK(context, context->allocate_temp(DataTypeToEnum<T>::value,
+                                                     transformed_input_shape,
+                                                     &transformed_input));
       const int64_t input_pad_top =
           dimensions.pad_rows_before - common_padding_rows;
       const int64_t input_pad_bottom =
@@ -528,7 +439,7 @@ struct LaunchFusedConv2DOp<GPUDevice, T> {
           FastBoundsCheck(input_pad_left, std::numeric_limits<int>::max()) &&
           FastBoundsCheck(input_pad_right, std::numeric_limits<int>::max());
       if (!in_bounds) {
-        context->SetStatus(errors::InvalidArgument("Padding is too large."));
+        context->SetStatus(absl::InvalidArgumentError("Padding is too large."));
         return;
       }
       functor::PadInput<GPUDevice, T, int, 4>()(
@@ -543,10 +454,15 @@ struct LaunchFusedConv2DOp<GPUDevice, T> {
       in_cols = new_in_cols;
     }
 
-    if (params.data_format == FORMAT_NHWC) {
+    const bool compute_in_nhwc = DataTypeToEnum<T>::value == DT_HALF &&
+                                 stream->GetCudaComputeCapability().IsAtLeast(
+                                     se::CudaComputeCapability::kVolta);
+    if (!compute_in_nhwc && params.data_format == FORMAT_NHWC) {
       // Convert the input tensor from NHWC to NCHW.
-      TensorShape nchw_shape =
-          ShapeFromFormat(FORMAT_NCHW, in_batch, in_rows, in_cols, in_depths);
+      TensorShape nchw_shape;
+      OP_REQUIRES_OK(
+          context, ShapeFromFormatWithStatus(FORMAT_NCHW, in_batch, in_rows,
+                                             in_cols, in_depths, &nchw_shape));
       if (in_depths > 1) {
         Tensor transformed_input;
         OP_REQUIRES_OK(context,
@@ -571,27 +487,50 @@ struct LaunchFusedConv2DOp<GPUDevice, T> {
       case FusedComputationType::kBiasAddWithRelu:
         dnn_activation_mode = se::dnn::ActivationMode::kRelu;
         break;
+      case FusedComputationType::kBiasAddWithRelu6:
+        dnn_activation_mode = se::dnn::ActivationMode::kRelu6;
+        break;
+      case FusedComputationType::kBiasAddWithElu:
+        dnn_activation_mode = se::dnn::ActivationMode::kElu;
+        break;
+      case FusedComputationType::kBiasAddWithLeakyRelu:
+        dnn_activation_mode = se::dnn::ActivationMode::kLeakyRelu;
+        break;
       default:
         LOG(FATAL) << "Unsupported fusion type";  // Crash OK
     }
+
+    const TensorFormat compute_data_format =
+        compute_in_nhwc ? FORMAT_NHWC : FORMAT_NCHW;
+    constexpr auto kComputeInNHWC =
+        std::make_tuple(se::dnn::DataLayout::kBatchYXDepth,
+                        se::dnn::FilterLayout::kOutputYXInput);
+    constexpr auto kComputeInNCHW =
+        std::make_tuple(se::dnn::DataLayout::kBatchDepthYX,
+                        se::dnn::FilterLayout::kOutputInputYX);
+    se::dnn::DataLayout compute_data_layout;
+    se::dnn::FilterLayout filter_layout;
+    std::tie(compute_data_layout, filter_layout) =
+        compute_in_nhwc ? kComputeInNHWC : kComputeInNCHW;
 
     se::dnn::BatchDescriptor input_desc;
     input_desc.set_count(in_batch)
         .set_feature_map_count(in_depths)
         .set_height(in_rows)
         .set_width(in_cols)
-        .set_layout(se::dnn::DataLayout::kBatchDepthYX);
+        .set_layout(compute_data_layout);
     se::dnn::FilterDescriptor filter_desc;
     filter_desc.set_input_filter_height(patch_rows)
         .set_input_filter_width(patch_cols)
         .set_input_feature_map_count(patch_depths)
-        .set_output_feature_map_count(filter.dim_size(3));
+        .set_output_feature_map_count(filter.dim_size(3))
+        .set_layout(filter_layout);
     se::dnn::BatchDescriptor bias_desc;
     bias_desc.set_count(1)
         .set_height(1)
         .set_width(1)
         .set_feature_map_count(out_depths)
-        .set_layout(se::dnn::DataLayout::kBatchDepthYX);
+        .set_layout(compute_data_layout);
     se::dnn::ConvolutionDescriptor conv_desc;
     conv_desc.set_vertical_dilation_rate(dimensions.dilation_rows)
         .set_horizontal_dilation_rate(dimensions.dilation_cols)
@@ -605,29 +544,53 @@ struct LaunchFusedConv2DOp<GPUDevice, T> {
         .set_height(out_rows)
         .set_width(out_cols)
         .set_feature_map_count(out_depths)
-        .set_layout(se::dnn::DataLayout::kBatchDepthYX);
+        .set_layout(compute_data_layout);
 
     Tensor transformed_filter;
-    OP_REQUIRES_OK(context,
-                   context->allocate_temp(
-                       DataTypeToEnum<T>::value,
-                       TensorShape({filter.dim_size(3), filter.dim_size(2),
-                                    filter.dim_size(0), filter.dim_size(1)}),
-                       &transformed_filter));
-    functor::TransformFilter<GPUDevice, T, int, 4>()(
-        context->eigen_device<GPUDevice>(), FORMAT_OIHW,
-        To32Bit(filter.tensor<T, 4>()),
-        To32Bit(transformed_filter.tensor<T, 4>()));
+    const auto transform_filter =
+        [&](FilterTensorFormat dst_format) -> absl::Status {
+      VLOG(4) << "Transform filter tensor from " << ToString(FORMAT_HWIO)
+              << " to " << ToString(dst_format);
+
+      TensorShape dst_shape =
+          dst_format == FORMAT_OIHW
+              ? TensorShape({filter.dim_size(3), filter.dim_size(2),
+                             filter.dim_size(0), filter.dim_size(1)})
+              : TensorShape({filter.dim_size(3), filter.dim_size(0),
+                             filter.dim_size(1), filter.dim_size(2)});
+
+      if (filter.NumElements() > std::numeric_limits<int32_t>::max()) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("Filter tensor num elements (", filter.NumElements(),
+                         ") exceeds 32-bit limit for GPU transformation"));
+      }
+      TF_RETURN_IF_ERROR(context->allocate_temp(
+          DataTypeToEnum<T>::value, dst_shape, &transformed_filter));
+
+      functor::TransformFilter<GPUDevice, T, int, 4>()(
+          context->eigen_device<GPUDevice>(), dst_format,
+          To32Bit(filter.tensor<T, 4>()),
+          To32Bit(transformed_filter.tensor<T, 4>()));
+
+      return absl::OkStatus();
+    };
+
+    if (compute_in_nhwc) {
+      OP_REQUIRES_OK(context, transform_filter(FORMAT_OHWI));
+    } else {
+      OP_REQUIRES_OK(context, transform_filter(FORMAT_OIHW));
+    }
 
     Tensor transformed_output;
-    if (params.data_format == FORMAT_NHWC) {
+    if (!compute_in_nhwc && params.data_format == FORMAT_NHWC) {
       // Only allocate temporary memory when a layout transformation is needed.
-      OP_REQUIRES_OK(context,
-                     context->allocate_temp(
-                         DataTypeToEnum<T>::value,
-                         ShapeFromFormat(FORMAT_NCHW, out_batch, out_rows,
-                                         out_cols, out_depths),
-                         &transformed_output));
+      TensorShape transformed_output_shape;
+      OP_REQUIRES_OK(context, ShapeFromFormatWithStatus(
+                                  FORMAT_NCHW, out_batch, out_rows, out_cols,
+                                  out_depths, &transformed_output_shape));
+      OP_REQUIRES_OK(context, context->allocate_temp(DataTypeToEnum<T>::value,
+                                                     transformed_output_shape,
+                                                     &transformed_output));
     } else {
       transformed_output = *output;
     }
@@ -646,14 +609,18 @@ struct LaunchFusedConv2DOp<GPUDevice, T> {
     se::DeviceMemory<T> side_input_ptr =
         AsDeviceMemory(static_cast<T*>(nullptr), 0);
 
-    int device_id = stream->parent()->device_ordinal();
+    constexpr double kConvScale = 1.0;
+    constexpr double kSideInputScale = 0.0;
+    double leakyrelu_alpha = fusion_args.leakyrelu_alpha;
+
     DataType dtype = input.dtype();
     ConvParameters conv_parameters = {
+        stream->parent(),
         in_batch,                      // batch
         in_depths,                     // in_depths
         {{in_rows,                     // in_rows
           in_cols}},                   // in_cols
-        FORMAT_NCHW,                   // compute_data_format
+        compute_data_format,           // compute_data_format
         out_depths,                    // out_depths
         {{patch_rows,                  // filter_rows
           patch_cols,                  // filter_cols
@@ -665,70 +632,82 @@ struct LaunchFusedConv2DOp<GPUDevice, T> {
         {{common_padding_rows,         // padding_rows
           common_padding_cols}},       // padding_cols
         dtype,                         // tensor datatype
-        device_id,                     // device_id
         conv_desc.group_count(),
-        ConvParameters::FusionInfo{
-            /*has_side_input=*/false,  // this op doesn't support side inputs.
-            dnn_activation_mode,       // activation_mode
-            /*is_contrib=*/false}};
+        ConvParameters::FusionInfo{kConvScale, kSideInputScale, leakyrelu_alpha,
+                                   dnn_activation_mode,  // activation_mode
+                                   /*is_contrib=*/false}};
 
-    constexpr double kConvInputScale = 1.0;
-    constexpr double kSideInputScale = 0.0;
-    // Launch fused convolution with given parameters and scratch allocator.
-    // Record profile result into `profile_result` if it's not nullptr.
-    const auto launch = [&](se::dnn::AlgorithmConfig algorithm_config,
-                            se::ScratchAllocator* scratch_allocator,
-                            se::DeviceMemory<T> output_ptr_to_use,
-                            se::dnn::ProfileResult* profile_result) -> Status {
-      if (CudnnUseFrontend()) {
-        return stream->FusedConvolveWithExecutionPlan(
-            input_desc, input_ptr,            // input
-            kConvInputScale,                  // input_scale
-            filter_desc, filter_ptr,          // filter
-            conv_desc,                        // conv
-            side_input_ptr, kSideInputScale,  // side_input
-            bias_desc, bias_ptr,              // bias
-            dnn_activation_mode,              // activation
-            output_desc, &output_ptr_to_use,  // output
-            scratch_allocator, algorithm_config, profile_result);
-      } else {
-        return stream->FusedConvolveWithAlgorithm(
-            input_desc, input_ptr,            // input
-            kConvInputScale,                  // input_scale
-            filter_desc, filter_ptr,          // filter
-            conv_desc,                        // conv
-            side_input_ptr, kSideInputScale,  // side_input
-            bias_desc, bias_ptr,              // bias
-            dnn_activation_mode,              // activation
-            output_desc, &output_ptr_to_use,  // output
-            scratch_allocator, algorithm_config, profile_result);
-      }
-    };
+    se::dnn::DataType element_type = se::dnn::ToDataType<T>::value;
 
-    se::dnn::AlgorithmConfig algorithm_config;
-    if (cudnn_use_autotune) {
-      auto status = FindBestConvolveAlgorithm<T>(
-          conv_parameters, input_desc, filter_desc, bias_desc, output_desc,
-          conv_desc, dnn_activation_mode, kConvInputScale, kSideInputScale,
-          launch, context, stream, output_ptr,
-          [&](absl::Span<const tensorflow::AutotuneResult> results) {
-            LogFusedConvForwardAutotuneResults(
-                se::dnn::ToDataType<T>::value, input_ptr, filter_ptr,
-                output_ptr, bias_ptr, side_input_ptr, input_desc, filter_desc,
-                output_desc, conv_desc, kConvInputScale, kSideInputScale,
-                dnn_activation_mode, stream->parent(), results);
-          },
-          &algorithm_config);
-      OP_REQUIRES_OK(context, status);
-    }
+    auto entry_or = AutotuneFusedConv<T>(
+        cudnn_use_autotune, FusedConvAutotuneMap::GetInstance(),
+        conv_parameters, context, input_desc, filter_desc, bias_desc,
+        output_desc, conv_desc, dnn_activation_mode, kConvScale,
+        kSideInputScale, leakyrelu_alpha, input_ptr, filter_ptr, output_ptr,
+        bias_ptr, side_input_ptr, ConvolveScratchSize());
+    OP_REQUIRES_OK(context, entry_or.status());
+    auto autotune_entry = std::move(entry_or).value();
 
     DnnScratchAllocator scratch_allocator(ConvolveScratchSize(), context);
-    Status cudnn_launch_status = launch(algorithm_config, &scratch_allocator,
-                                        output_ptr, /*profile_result=*/nullptr);
+    absl::Status cudnn_launch_status;
+    if (!autotune_entry.is_algorithm_config()) {
+      auto& runners = autotune_entry.GetOpRunners();
+      se::dnn::FusedConvOp::Config config{se::dnn::ConvolutionKind::FORWARD,
+                                          element_type,
+                                          element_type,
+                                          element_type,
+                                          kConvScale,
+                                          kSideInputScale,
+                                          leakyrelu_alpha,
+                                          input_desc,
+                                          filter_desc,
+                                          bias_desc,
+                                          output_desc,
+                                          conv_desc,
+                                          dnn_activation_mode};
+      auto primary_or = runners.primary->GetOrCreateRunner(config, stream);
+      OP_REQUIRES_OK(context, primary_or.status());
+      auto* primary = primary_or.value();
+
+      const se::dnn::FusedConvRunner* no_scratch_fallback = nullptr;
+      if (runners.no_scratch_fallback) {
+        auto no_scratch_fallback_or =
+            runners.no_scratch_fallback->GetOrCreateRunner(config, stream);
+        OP_REQUIRES_OK(context, no_scratch_fallback_or.status());
+        no_scratch_fallback = no_scratch_fallback_or.value();
+      }
+
+      auto runner_and_scratch_or =
+          AllocateScratchOrFallback<se::dnn::FusedConvOp::Signature>(
+              &scratch_allocator, primary, no_scratch_fallback);
+      OP_REQUIRES_OK(context, runner_and_scratch_or.status());
+      auto runner_and_scratch = std::move(runner_and_scratch_or).value();
+      auto& runner =
+          *std::get<const se::dnn::FusedConvRunner*>(runner_and_scratch);
+      cudnn_launch_status = runner(
+          stream, nullptr,
+          std::get<stream_executor::DeviceAddressBase>(runner_and_scratch),
+          input_ptr, filter_ptr, side_input_ptr, bias_ptr, output_ptr);
+    } else {
+      auto dnn = stream->parent()->AsDnn();
+      OP_REQUIRES(context, dnn != nullptr,
+                  absl::InternalError("No DNN for stream."));
+      cudnn_launch_status = dnn->FusedConvolveWithAlgorithm(
+          stream, input_desc, input_ptr,    // input
+          kConvScale,                       // input_scale
+          filter_desc, filter_ptr,          // filter
+          conv_desc,                        // conv
+          side_input_ptr, kSideInputScale,  // side_input
+          bias_desc, bias_ptr,              // bias
+          dnn_activation_mode,              // activation
+          output_desc, &output_ptr,         // output
+          &scratch_allocator, autotune_entry.GetAlgorithmConfig(), nullptr);
+    }
+
     OP_REQUIRES_OK(context, cudnn_launch_status);
 
     // Convert the output tensor back from NCHW to NHWC.
-    if (params.data_format == FORMAT_NHWC) {
+    if (!compute_in_nhwc && params.data_format == FORMAT_NHWC) {
       functor::NCHWToNHWC<GPUDevice, T, 4>()(
           context->eigen_device<GPUDevice>(),
           const_cast<const Tensor&>(transformed_output).tensor<T, 4>(),
@@ -736,6 +715,12 @@ struct LaunchFusedConv2DOp<GPUDevice, T> {
     }
   }
 };
+
+template <>
+struct LaunchFusedConv2DOp<GPUDevice, int8_t>;
+
+template <>
+struct LaunchFusedConv2DOp<GPUDevice, qint8>;
 
 #endif  // GOOGLE_CUDA
 
@@ -751,7 +736,7 @@ class FusedConv2DOp : public OpKernel {
     using FCT = FusedComputationType;
 
     std::vector<FusedComputationPattern> patterns;
-    if (std::is_same<Device, CPUDevice>::value) {
+    if (std::is_same_v<Device, CPUDevice>) {
       patterns = {
           {FCT::kBiasAdd, {"BiasAdd"}},
           {FCT::kBiasAddWithRelu, {"BiasAdd", "Relu"}},
@@ -770,8 +755,18 @@ class FusedConv2DOp : public OpKernel {
     // identity activation function, it in theory should allow to fuse
     // convolution with BiasAdd, but in practice it doesn't work, cuDNN ignores
     // this parameter and always does Relu activation.
-    if (std::is_same<Device, GPUDevice>::value) {
-      patterns = {{FCT::kBiasAddWithRelu, {"BiasAdd", "Relu"}}};
+    if (std::is_same_v<Device, GPUDevice>) {
+      if (std::is_same_v<T, int8_t> || std::is_same_v<T, qint8>) {
+        patterns = {{FCT::kBiasAdd, {"BiasAdd"}},
+                    {FCT::kBiasAddWithRelu, {"BiasAdd", "Relu"}}};
+      } else {
+        patterns = {
+            {FCT::kBiasAddWithRelu, {"BiasAdd", "Relu"}},
+            {FCT::kBiasAddWithRelu6, {"BiasAdd", "Relu6"}},
+            {FCT::kBiasAddWithElu, {"BiasAdd", "Elu"}},
+            {FCT::kBiasAddWithLeakyRelu, {"BiasAdd", "LeakyRelu"}},
+        };
+      }
     }
 
     OP_REQUIRES_OK(context, InitializeFusedComputation(
@@ -792,9 +787,11 @@ class FusedConv2DOp : public OpKernel {
     OP_REQUIRES_OK(context,
                    ComputeConv2DDimension(params_, input, filter, &dimensions));
 
-    TensorShape out_shape = ShapeFromFormat(
-        params_.data_format, dimensions.batch, dimensions.out_rows,
-        dimensions.out_cols, dimensions.out_depth);
+    TensorShape out_shape;
+    OP_REQUIRES_OK(
+        context, ShapeFromFormatWithStatus(
+                     params_.data_format, dimensions.batch, dimensions.out_rows,
+                     dimensions.out_cols, dimensions.out_depth, &out_shape));
 
     // Output tensor is of the following dimensions:
     // [ in_batch, out_rows, out_cols, out_depth ]
@@ -832,7 +829,8 @@ class FusedConv2DOp : public OpKernel {
   FusedComputationType fused_computation_ = FusedComputationType::kUndefined;
   FusedComputationArgs fused_computation_args_;
 
-  TF_DISALLOW_COPY_AND_ASSIGN(FusedConv2DOp);
+  FusedConv2DOp(const FusedConv2DOp&) = delete;
+  void operator=(const FusedConv2DOp&) = delete;
 };
 
 // Registration of the CPU implementations.
@@ -860,10 +858,12 @@ class FusedConv2DOp : public OpKernel {
   extern template struct PadInput<GPUDevice, T, int, 4>
 
 // Registration of the GPU implementations.
-#define REGISTER_FUSED_GPU_CONV2D(T)                                  \
-  REGISTER_KERNEL_BUILDER(                                            \
-      Name("_FusedConv2D").Device(DEVICE_GPU).TypeConstraint<T>("T"), \
-      FusedConv2DOp<GPUDevice, T>);
+#define REGISTER_FUSED_GPU_CONV2D(T)                    \
+  REGISTER_KERNEL_BUILDER(Name("_FusedConv2D")          \
+                              .Device(DEVICE_GPU)       \
+                              .TypeConstraint<T>("T")   \
+                              .HostMemory("host_args"), \
+                          FusedConv2DOp<GPUDevice, T>);
 
 #endif  // GOOGLE_CUDA
 

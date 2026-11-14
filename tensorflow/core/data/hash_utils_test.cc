@@ -15,6 +15,14 @@ limitations under the License.
 
 #include "tensorflow/core/data/hash_utils.h"
 
+#include <utility>
+#include <vector>
+
+#include <gmock/gmock.h>
+#include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "xla/tsl/protobuf/error_codes.pb.h"
+#include "tensorflow/core/framework/attr_value.pb.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/function.pb.h"
 #include "tensorflow/core/framework/node_def_builder.h"
@@ -23,6 +31,8 @@ limitations under the License.
 #include "tensorflow/core/framework/variant.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/platform/test.h"
+#include "tensorflow/core/platform/test_benchmark.h"
+#include "tensorflow/core/protobuf/config.pb.h"
 #include "tensorflow/core/protobuf/error_codes.pb.h"
 #include "tensorflow/core/util/work_sharder.h"
 
@@ -33,7 +43,7 @@ using ::testing::ContainsRegex;
 
 class DatasetHashUtilsTest : public ::testing::Test {
  protected:
-  uint64 GetHash(const FunctionDefLibrary& library, const FunctionDef& fn) {
+  uint64_t GetHash(const FunctionDefLibrary& library, const FunctionDef& fn) {
     // Construct a node with a function as an attr.
     GraphDef graph_def;
     *graph_def.mutable_library() = library;
@@ -42,24 +52,26 @@ class DatasetHashUtilsTest : public ::testing::Test {
     NameAttrList func;
     func.set_name(fn.signature().name());
     AddNodeAttr("f", func, node);
-    uint64 hash = 0;
+    uint64_t hash = 0;
     TF_CHECK_OK(HashNode(graph_def, *node, &hash));
     return hash;
   }
 
-  Status CheckEqual(const FunctionDefLibrary& library, const FunctionDef& fn1,
-                    const FunctionDef& fn2) {
+  absl::Status CheckEqual(const FunctionDefLibrary& library,
+                          const FunctionDef& fn1, const FunctionDef& fn2) {
     // Construct nodes with a function as an attr.
     GraphDef graph_def;
     *graph_def.mutable_library() = library;
 
     NodeDef* node1 = graph_def.add_node();
+    node1->set_name("RemoteCall");
     node1->set_op("RemoteCall");
     NameAttrList func1;
     func1.set_name(fn1.signature().name());
     AddNodeAttr("f", func1, node1);
 
     NodeDef* node2 = graph_def.add_node();
+    node1->set_name("RemoteCall2");
     node2->set_op("RemoteCall");
     NameAttrList func2;
     func2.set_name(fn2.signature().name());
@@ -68,14 +80,14 @@ class DatasetHashUtilsTest : public ::testing::Test {
     return CheckSubgraphsEqual(graph_def, node1, graph_def, node2);
   }
 
-  uint64 GetHash(const GraphDef& graph, const NodeDef& node) {
-    uint64 hash = 0;
+  uint64_t GetHash(const GraphDef& graph, const NodeDef& node) {
+    uint64_t hash = 0;
     TF_CHECK_OK(HashNode(graph, node, &hash));
     return hash;
   }
 
-  uint64 GetHash(const Tensor& tensor) {
-    uint64 hash = 0;
+  uint64_t GetHash(const Tensor& tensor) {
+    uint64_t hash = 0;
     TF_CHECK_OK(HashTensor(tensor, &hash));
     return hash;
   }
@@ -125,9 +137,9 @@ TEST_F(DatasetHashUtilsTest, HashFunctionDifferentFunctions) {
 
   // The second op in `f2` is changed to "Add"
   EXPECT_NE(GetHash(fl, *f1), GetHash(fl, *f2));
-  Status s = CheckEqual(fl, *f1, *f2);
+  absl::Status s = CheckEqual(fl, *f1, *f2);
   EXPECT_NE(s.code(), error::OK);
-  EXPECT_THAT(s.error_message(), ContainsRegex("Add"));
+  EXPECT_THAT(s.message(), ContainsRegex("Add"));
 }
 
 TEST_F(DatasetHashUtilsTest, HashFunctionDifferentInternalNodeNames) {
@@ -143,7 +155,7 @@ TEST_F(DatasetHashUtilsTest, HashFunctionDifferentInternalNodeNames) {
 
   FunctionDef* f2 = fl.add_function();
   *f2 = FunctionDefHelper::Create(
-      "AddAndMul", {"a: float", "b: float", "c: float"}, {"o: float"}, {},
+      "AddAndMul2", {"a: float", "b: float", "c: float"}, {"o: float"}, {},
       {{{"add"}, "Add", {"a", "b"}, {{"T", DT_FLOAT}}},
        {{"mul"}, "Mul", {"add:z:0", "c"}, {{"T", DT_FLOAT}}}},
       /*ret_def=*/{{"o", "mul:z:0"}},
@@ -154,7 +166,7 @@ TEST_F(DatasetHashUtilsTest, HashFunctionDifferentInternalNodeNames) {
 }
 
 TEST_F(DatasetHashUtilsTest, HashGraphWithMultipleCycles) {
-  uint64 hash = 0;
+  uint64_t hash = 0;
   for (int i = 0; i < 1000; ++i) {
     GraphDef g;
     NodeDef* output_node = g.add_node();
@@ -178,7 +190,7 @@ TEST_F(DatasetHashUtilsTest, HashGraphWithMultipleCycles) {
     TF_CHECK_OK(NodeDefBuilder("E", "Floor")
                     .Input("B", 0, DT_FLOAT)
                     .Finalize(g.add_node()));
-    uint64 t = GetHash(g, *output_node);
+    uint64_t t = GetHash(g, *output_node);
     if (hash == 0) {
       hash = t;
     } else {
@@ -228,8 +240,8 @@ TEST_F(DatasetHashUtilsTest, HashNodeSameGraphDifferentNames) {
                   .Input(n5->name(), 0, DT_INT32)
                   .Finalize(n6));
 
-  uint64 hash1 = GetHash(gd, *n3);
-  uint64 hash2 = GetHash(gd, *n6);
+  uint64_t hash1 = GetHash(gd, *n3);
+  uint64_t hash2 = GetHash(gd, *n6);
   EXPECT_EQ(hash1, hash2);
   TF_EXPECT_OK(CheckSubgraphsEqual(gd, n3, gd, n6));
 }
@@ -263,14 +275,14 @@ TEST_F(DatasetHashUtilsTest, HashNodeDifferentGraphs) {
                   .Input(n2->name(), 0, DT_INT32)
                   .Finalize(n4));
 
-  uint64 hash1 = GetHash(gd, *n3);
-  uint64 hash2 = GetHash(gd, *n4);
+  uint64_t hash1 = GetHash(gd, *n3);
+  uint64_t hash2 = GetHash(gd, *n4);
   // We expect different hashes because the op has changed.
   EXPECT_NE(hash1, hash2);
-  Status s = CheckSubgraphsEqual(gd, n3, gd, n4);
+  absl::Status s = CheckSubgraphsEqual(gd, n3, gd, n4);
   EXPECT_NE(s.code(), error::OK);
-  EXPECT_THAT(s.error_message(), ContainsRegex("Add"));
-  EXPECT_THAT(s.error_message(), ContainsRegex("Mul"));
+  EXPECT_THAT(s.message(), ContainsRegex("Add"));
+  EXPECT_THAT(s.message(), ContainsRegex("Mul"));
 }
 
 TEST_F(DatasetHashUtilsTest, HashSameGraphDifferentSeeds) {
@@ -339,8 +351,8 @@ TEST_F(DatasetHashUtilsTest, HashSameGraphDifferentSeeds) {
                   .Device("CPU:0")
                   .Finalize(shuffle_ds_2));
 
-  uint64 hash1 = GetHash(gd, *shuffle_ds);
-  uint64 hash2 = GetHash(gd, *shuffle_ds_2);
+  uint64_t hash1 = GetHash(gd, *shuffle_ds);
+  uint64_t hash2 = GetHash(gd, *shuffle_ds_2);
   EXPECT_EQ(hash1, hash2);
   TF_EXPECT_OK(CheckSubgraphsEqual(gd, shuffle_ds, gd, shuffle_ds_2));
 }
@@ -388,8 +400,8 @@ TEST_F(DatasetHashUtilsTest, HashNodeSameGraphDifferentColocationNames) {
                   .Input(n2->name(), 0, DT_INT32)
                   .Finalize(n6));
 
-  uint64 hash1 = GetHash(gd, *n3);
-  uint64 hash2 = GetHash(gd, *n6);
+  uint64_t hash1 = GetHash(gd, *n3);
+  uint64_t hash2 = GetHash(gd, *n6);
 
   EXPECT_EQ(hash1, hash2);
   TF_EXPECT_OK(CheckSubgraphsEqual(gd, n3, gd, n6));
@@ -418,19 +430,19 @@ TEST_F(DatasetHashUtilsTest, HashNodeReversedOrder) {
                   .Finalize(n3));
 
   NodeDef* n4 = gd.add_node();
-  TF_CHECK_OK(NodeDefBuilder("graph_1/node_3", "Add")
+  TF_CHECK_OK(NodeDefBuilder("graph_1/node_4", "Add")
                   .Device("CPU:0")
                   .Input(n2->name(), 0, DT_INT32)
                   .Input(n1->name(), 0, DT_INT32)
                   .Finalize(n4));
 
-  uint64 hash1 = GetHash(gd, *n3);
-  uint64 hash2 = GetHash(gd, *n4);
+  uint64_t hash1 = GetHash(gd, *n3);
+  uint64_t hash2 = GetHash(gd, *n4);
   // We expect different hashes because the inputs of n3 are swapped.
   EXPECT_NE(hash1, hash2);
-  Status s = CheckSubgraphsEqual(gd, n3, gd, n4);
+  absl::Status s = CheckSubgraphsEqual(gd, n3, gd, n4);
   EXPECT_NE(s.code(), error::OK);
-  EXPECT_THAT(s.error_message(), ContainsRegex("AttrValues are different"));
+  EXPECT_THAT(s.message(), ContainsRegex("AttrValues are different"));
 }
 
 TEST_F(DatasetHashUtilsTest, HashNodeInputPortChanged) {
@@ -456,20 +468,20 @@ TEST_F(DatasetHashUtilsTest, HashNodeInputPortChanged) {
                   .Finalize(n3));
 
   NodeDef* n4 = gd.add_node();
-  TF_CHECK_OK(NodeDefBuilder("graph_1/node_3", "Add")
+  TF_CHECK_OK(NodeDefBuilder("graph_1/node_4", "Add")
                   .Device("CPU:0")
                   .Input(n1->name(), 1, DT_INT32)
                   .Input(n2->name(), 2, DT_INT32)
                   .Finalize(n4));
 
-  uint64 hash1 = GetHash(gd, *n3);
-  uint64 hash2 = GetHash(gd, *n4);
+  uint64_t hash1 = GetHash(gd, *n3);
+  uint64_t hash2 = GetHash(gd, *n4);
   // We expect different hashes because the input ports for nodes used by n3
   // has changed.
   EXPECT_NE(hash1, hash2);
-  Status s = CheckSubgraphsEqual(gd, n3, gd, n4);
+  absl::Status s = CheckSubgraphsEqual(gd, n3, gd, n4);
   EXPECT_NE(s.code(), error::OK);
-  EXPECT_THAT(s.error_message(), ContainsRegex("Node inputs"));
+  EXPECT_THAT(s.message(), ContainsRegex("Node inputs"));
 }
 
 TEST_F(DatasetHashUtilsTest, HashNodeSameFunctionDifferentNames) {
@@ -521,7 +533,7 @@ TEST_F(DatasetHashUtilsTest, HashNodeSameFunctionDifferentNames) {
   NameAttrList* nal2 = a2.mutable_func();
   nal2->set_name("AddAndMul2");
 
-  TF_CHECK_OK(NodeDefBuilder("graph_1/node_2", "For")
+  TF_CHECK_OK(NodeDefBuilder("graph_1/node_3", "For")
                   .Input(n1->name(), 0, DT_INT32)
                   .Input(n1->name(), 0, DT_INT32)
                   .Input(n1->name(), 0, DT_INT32)
@@ -530,8 +542,8 @@ TEST_F(DatasetHashUtilsTest, HashNodeSameFunctionDifferentNames) {
                   .Device("CPU:0")
                   .Finalize(n3));
 
-  uint64 hash1 = GetHash(gd, *n2);
-  uint64 hash2 = GetHash(gd, *n3);
+  uint64_t hash1 = GetHash(gd, *n2);
+  uint64_t hash2 = GetHash(gd, *n3);
   EXPECT_EQ(hash1, hash2);
   TF_EXPECT_OK(CheckSubgraphsEqual(gd, n2, gd, n3));
 }
@@ -587,7 +599,7 @@ TEST_F(DatasetHashUtilsTest, HashNodeSameFunctionListsDifferentNames) {
   NameAttrList* nal2 = list2->add_func();
   nal2->set_name("AddAndMul2");
 
-  TF_CHECK_OK(NodeDefBuilder("graph_1/node_2", "For")
+  TF_CHECK_OK(NodeDefBuilder("graph_1/node_3", "For")
                   .Input(n1->name(), 0, DT_INT32)
                   .Input(n1->name(), 0, DT_INT32)
                   .Input(n1->name(), 0, DT_INT32)
@@ -596,8 +608,8 @@ TEST_F(DatasetHashUtilsTest, HashNodeSameFunctionListsDifferentNames) {
                   .Device("CPU:0")
                   .Finalize(n3));
 
-  uint64 hash1 = GetHash(gd, *n2);
-  uint64 hash2 = GetHash(gd, *n3);
+  uint64_t hash1 = GetHash(gd, *n2);
+  uint64_t hash2 = GetHash(gd, *n3);
   EXPECT_EQ(hash1, hash2);
   TF_EXPECT_OK(CheckSubgraphsEqual(gd, n2, gd, n3));
 }
@@ -639,13 +651,13 @@ TEST_F(DatasetHashUtilsTest, HashNodeSameFunctionsOps) {
                   .Finalize(n2));
 
   NodeDef* n3 = gd.add_node();
-  TF_CHECK_OK(NodeDefBuilder("graph_1/node_2", "AddAndMul2", &flib)
+  TF_CHECK_OK(NodeDefBuilder("graph_1/node_3", "AddAndMul2", &flib)
                   .Input(n1->name(), 0, DT_FLOAT)
                   .Device("CPU:0")
                   .Finalize(n3));
 
-  uint64 hash1 = GetHash(gd, *n2);
-  uint64 hash2 = GetHash(gd, *n3);
+  uint64_t hash1 = GetHash(gd, *n2);
+  uint64_t hash2 = GetHash(gd, *n3);
   EXPECT_EQ(hash1, hash2);
   TF_EXPECT_OK(CheckSubgraphsEqual(gd, n2, gd, n3));
 }
@@ -687,18 +699,18 @@ TEST_F(DatasetHashUtilsTest, HashNodeDifferentFunctionsOps) {
                   .Finalize(n2));
 
   NodeDef* n3 = gd.add_node();
-  TF_CHECK_OK(NodeDefBuilder("graph_1/node_2", "AddAndMul2", &flib)
+  TF_CHECK_OK(NodeDefBuilder("graph_1/node_3", "AddAndMul2", &flib)
                   .Input(n1->name(), 0, DT_FLOAT)
                   .Device("CPU:0")
                   .Finalize(n3));
 
-  uint64 hash1 = GetHash(gd, *n2);
-  uint64 hash2 = GetHash(gd, *n3);
+  uint64_t hash1 = GetHash(gd, *n2);
+  uint64_t hash2 = GetHash(gd, *n3);
   EXPECT_NE(hash1, hash2);
-  Status s = CheckSubgraphsEqual(gd, n2, gd, n3);
+  absl::Status s = CheckSubgraphsEqual(gd, n2, gd, n3);
   EXPECT_NE(s.code(), error::OK);
   EXPECT_THAT(
-      s.error_message(),
+      s.message(),
       ContainsRegex("Functions AddAndMul and AddAndMul2 are not the same"));
 }
 
@@ -754,7 +766,7 @@ TEST_F(DatasetHashUtilsTest, HashNodeDifferentFunctions) {
   NameAttrList* nal2 = a2.mutable_func();
   nal2->set_name("AddAndMul2");
 
-  TF_CHECK_OK(NodeDefBuilder("graph_1/node_2", "For")
+  TF_CHECK_OK(NodeDefBuilder("graph_1/node_3", "For")
                   .Input(n1->name(), 0, DT_INT32)
                   .Input(n1->name(), 0, DT_INT32)
                   .Input(n1->name(), 0, DT_INT32)
@@ -763,13 +775,13 @@ TEST_F(DatasetHashUtilsTest, HashNodeDifferentFunctions) {
                   .Device("CPU:0")
                   .Finalize(n3));
 
-  uint64 hash1 = GetHash(gd, *n2);
-  uint64 hash2 = GetHash(gd, *n3);
+  uint64_t hash1 = GetHash(gd, *n2);
+  uint64_t hash2 = GetHash(gd, *n3);
   EXPECT_NE(hash1, hash2);
-  Status s = CheckSubgraphsEqual(gd, n2, gd, n3);
+  absl::Status s = CheckSubgraphsEqual(gd, n2, gd, n3);
   EXPECT_NE(s.code(), error::OK);
   EXPECT_THAT(
-      s.error_message(),
+      s.message(),
       ContainsRegex("Functions AddAndMul and AddAndMul2 are not the same"));
 }
 
@@ -827,7 +839,7 @@ TEST_F(DatasetHashUtilsTest, HashNodeDifferentFunctionLists) {
   NameAttrList* nal2 = list2->add_func();
   nal2->set_name("AddAndMul2");
 
-  TF_CHECK_OK(NodeDefBuilder("graph_1/node_2", "For")
+  TF_CHECK_OK(NodeDefBuilder("graph_1/node_3", "For")
                   .Input(n1->name(), 0, DT_INT32)
                   .Input(n1->name(), 0, DT_INT32)
                   .Input(n1->name(), 0, DT_INT32)
@@ -836,13 +848,13 @@ TEST_F(DatasetHashUtilsTest, HashNodeDifferentFunctionLists) {
                   .Device("CPU:0")
                   .Finalize(n3));
 
-  uint64 hash1 = GetHash(gd, *n2);
-  uint64 hash2 = GetHash(gd, *n3);
+  uint64_t hash1 = GetHash(gd, *n2);
+  uint64_t hash2 = GetHash(gd, *n3);
   EXPECT_NE(hash1, hash2);
-  Status s = CheckSubgraphsEqual(gd, n2, gd, n3);
+  absl::Status s = CheckSubgraphsEqual(gd, n2, gd, n3);
   EXPECT_NE(s.code(), error::OK);
   EXPECT_THAT(
-      s.error_message(),
+      s.message(),
       ContainsRegex("Functions AddAndMul and AddAndMul2 are not the same"));
 }
 
@@ -875,20 +887,19 @@ TEST_F(DatasetHashUtilsTest, HashNodeDifferentControlInputs) {
                   .Finalize(n4));
 
   NodeDef* n5 = gd.add_node();
-  TF_CHECK_OK(NodeDefBuilder("graph_1/node_4", "Identity")
+  TF_CHECK_OK(NodeDefBuilder("graph_1/node_5", "Identity")
                   .Device("CPU:0")
                   .Input(n1->name(), 0, DT_INT32)
                   .ControlInput(n3->name())
                   .Finalize(n5));
 
   // Control inputs are different between these two graphs.
-  uint64 hash1 = GetHash(gd, *n4);
-  uint64 hash2 = GetHash(gd, *n5);
+  uint64_t hash1 = GetHash(gd, *n4);
+  uint64_t hash2 = GetHash(gd, *n5);
   EXPECT_NE(hash1, hash2);
-  Status s = CheckSubgraphsEqual(gd, n4, gd, n5);
+  absl::Status s = CheckSubgraphsEqual(gd, n4, gd, n5);
   EXPECT_NE(s.code(), error::OK);
-  EXPECT_THAT(s.error_message(),
-              ContainsRegex("Control dependencies are different"));
+  EXPECT_THAT(s.message(), ContainsRegex("Control dependencies are different"));
 }
 
 TEST_F(DatasetHashUtilsTest, HashNodeControlInputDifferentOrdering) {
@@ -921,15 +932,15 @@ TEST_F(DatasetHashUtilsTest, HashNodeControlInputDifferentOrdering) {
                   .Finalize(n4));
 
   NodeDef* n5 = gd.add_node();
-  TF_CHECK_OK(NodeDefBuilder("graph_1/node_4", "Identity")
+  TF_CHECK_OK(NodeDefBuilder("graph_1/node_5", "Identity")
                   .Device("CPU:0")
                   .Input(n1->name(), 0, DT_INT32)
                   .ControlInput(n3->name())
                   .ControlInput(n2->name())
                   .Finalize(n5));
 
-  uint64 hash1 = GetHash(gd, *n4);
-  uint64 hash2 = GetHash(gd, *n5);
+  uint64_t hash1 = GetHash(gd, *n4);
+  uint64_t hash2 = GetHash(gd, *n5);
   EXPECT_EQ(hash1, hash2);
   TF_EXPECT_OK(CheckSubgraphsEqual(gd, n4, gd, n5));
 }
@@ -957,7 +968,7 @@ TEST_F(DatasetHashUtilsTest, HashNodeDifferentGraphSamePartialGraph) {
                   .Input(n2->name(), 0, DT_INT32)
                   .Finalize(n3));
 
-  uint64 hash1 = GetHash(gd, *n1);
+  uint64_t hash1 = GetHash(gd, *n1);
 
   n3->Clear();
   TF_CHECK_OK(NodeDefBuilder("graph_1/node_3", "Mul")
@@ -966,7 +977,7 @@ TEST_F(DatasetHashUtilsTest, HashNodeDifferentGraphSamePartialGraph) {
                   .Input(n2->name(), 0, DT_INT32)
                   .Finalize(n3));
 
-  uint64 hash2 = GetHash(gd, *n1);
+  uint64_t hash2 = GetHash(gd, *n1);
 
   EXPECT_EQ(hash1, hash2);
 }
@@ -1000,7 +1011,7 @@ TEST_F(DatasetHashUtilsTest, HashFunctionsWithControlDependencyLoop) {
   NameAttrList* nal1 = a1.mutable_func();
   nal1->set_name("AddAndMul");
 
-  std::pair<string, FunctionDefHelper::AttrValueWrapper> func_attr = {
+  std::pair<std::string, FunctionDefHelper::AttrValueWrapper> func_attr = {
       "body", FunctionDefHelper::AttrValueWrapper(*nal1)};
 
   FunctionDef func = FunctionDefHelper::Create(
@@ -1137,14 +1148,14 @@ TEST_F(DatasetHashUtilsTest, HashInt32Tensor) {
   EXPECT_NE(GetHash(s1), GetHash(s3));
 
   Tensor v1(DT_INT32, TensorShape({2}));
-  v1.vec<int32>()(0) = 0;
-  v1.vec<int32>()(1) = 1;
+  v1.vec<int32_t>()(0) = 0;
+  v1.vec<int32_t>()(1) = 1;
   Tensor v2(DT_INT32, TensorShape({2}));
-  v2.vec<int32>()(0) = 0;
-  v2.vec<int32>()(1) = 1;
+  v2.vec<int32_t>()(0) = 0;
+  v2.vec<int32_t>()(1) = 1;
   Tensor v3(DT_INT32, TensorShape({2}));
-  v3.vec<int32>()(0) = 0;
-  v3.vec<int32>()(1) = 2;
+  v3.vec<int32_t>()(0) = 0;
+  v3.vec<int32_t>()(1) = 2;
 
   EXPECT_EQ(GetHash(v1), GetHash(v2));
   EXPECT_NE(GetHash(v1), GetHash(v3));
@@ -1171,6 +1182,182 @@ TEST_F(DatasetHashUtilsTest, HashStringTensor) {
   EXPECT_EQ(GetHash(v1), GetHash(v2));
   EXPECT_NE(GetHash(v1), GetHash(v3));
 }
+
+// Benchmark that simulates a shallow and wide graph.
+static void BM_ParallelFunctionCallsGraph(benchmark::State& state) {
+  GraphDef graph_def;
+  FunctionDefLibrary* fl = graph_def.mutable_library();
+
+  FunctionDef* fd = fl->add_function();
+  *fd = FunctionDefHelper::Create(
+      "AddAndMul", {"i: float"}, {"o: float"}, {},
+      {{{"add"}, "Add", {"i", "i"}, {{"T", DT_FLOAT}}},
+       {{"ret"}, "Mul", {"i", "i"}, {{"T", DT_FLOAT}}}},
+      /*ret_def=*/{{"o", "ret:z:0"}},
+      /*control_ret_def=*/{{"must_execute", "add"}});
+
+  NodeDef* input = graph_def.add_node();
+  input->set_name("InputPlaceholder");
+  input->set_op("Placeholder");
+  AddNodeAttr("dtype", DT_FLOAT, input);
+
+  // Equivalent of a `tf.group()`.
+  NodeDef* target = graph_def.add_node();
+  target->set_name("Target");
+  target->set_op("NoOp");
+
+  // Create 100 parallel PartitionedCalls that all depend on input. Generate a
+  // NodeDef that has close to similar attributes that TensorFlow will generate.
+  ConfigProto config_pb;
+  config_pb.mutable_device_count()->insert({"CPU", 1});
+  config_pb.mutable_device_count()->insert({"GPU", 1});
+  config_pb.set_allow_soft_placement(true);
+  for (int i = 0; i < 100; ++i) {
+    NodeDef* node = graph_def.add_node();
+    node->set_name(absl::StrCat("PartitionedCall_", i));
+    node->set_op("PartitionedCall");
+    *node->add_input() = input->name();
+    AddNodeAttr("Tin", DT_FLOAT, node);
+    AddNodeAttr("Tout", DT_FLOAT, node);
+    AddNodeAttr("config", "", node);
+    AddNodeAttr("config_proto", config_pb.SerializeAsString(), node);
+    NameAttrList func;
+    func.set_name(fd->signature().name());
+    AddNodeAttr("f", func, node);
+    *target->add_input() = absl::StrCat("^", node->name());
+  }
+
+  uint64_t hash_value;
+  for (auto _ : state) {
+    TF_CHECK_OK(HashNode(graph_def, *target, &hash_value));
+  }
+}
+BENCHMARK(BM_ParallelFunctionCallsGraph);
+
+// Benchmark that simulates a narrow and deep graph.
+static void BM_ChainedFunctionCallsGraph(benchmark::State& state) {
+  GraphDef graph_def;
+  FunctionDefLibrary* fl = graph_def.mutable_library();
+
+  FunctionDef* fd = fl->add_function();
+  *fd = FunctionDefHelper::Create(
+      "AddAndMul", {"i: float"}, {"o: float"}, {},
+      {{{"add"}, "Add", {"i", "i"}, {{"T", DT_FLOAT}}},
+       {{"ret"}, "Mul", {"i", "i"}, {{"T", DT_FLOAT}}}},
+      /*ret_def=*/{{"o", "ret:z:0"}},
+      /*control_ret_def=*/{{"must_execute", "add"}});
+
+  NodeDef* input = graph_def.add_node();
+  input->set_name("InputPlaceholder");
+  input->set_op("Placeholder");
+  AddNodeAttr("dtype", DT_FLOAT, input);
+
+  // Create 100 chained PartitionedCalls, each depending on the previous.
+  // Generate a NodeDef that has close to similar attributes that TensorFlow
+  // will generate.
+  ConfigProto config_pb;
+  config_pb.mutable_device_count()->insert({"CPU", 1});
+  config_pb.mutable_device_count()->insert({"GPU", 1});
+  config_pb.set_allow_soft_placement(true);
+  for (int i = 0; i < 100; ++i) {
+    NodeDef* node = graph_def.add_node();
+    node->set_name(absl::StrCat("PartitionedCall_", i));
+    node->set_op("PartitionedCall");
+    if (i > 0) {
+      *node->add_input() = absl::StrCat("PartitionedCall_", i - 1);
+    } else {
+      *node->add_input() = input->name();
+    }
+    AddNodeAttr("Tin", DT_FLOAT, node);
+    AddNodeAttr("Tout", DT_FLOAT, node);
+    AddNodeAttr("config", "", node);
+    AddNodeAttr("config_proto", config_pb.SerializeAsString(), node);
+    NameAttrList func;
+    func.set_name(fd->signature().name());
+    AddNodeAttr("f", func, node);
+  }
+
+  const NodeDef& target = graph_def.node(graph_def.node_size() - 1);
+
+  uint64_t hash_value;
+  for (auto _ : state) {
+    TF_CHECK_OK(HashNode(graph_def, target, &hash_value));
+  }
+}
+BENCHMARK(BM_ChainedFunctionCallsGraph);
+
+// Benchmark that simulates many nested function calls.
+static void BM_ComposedFunctionCallsGraph(benchmark::State& state) {
+  GraphDef graph_def;
+  FunctionDefLibrary* fl = graph_def.mutable_library();
+
+  // AddAndMul will be the last function, all others will be calls up to this.
+  FunctionDef* fd = fl->add_function();
+  *fd = FunctionDefHelper::Create(
+      "AddAndMul", {"i: float"}, {"o: float"}, {},
+      {{{"add"}, "Add", {"i", "i"}, {{"T", DT_FLOAT}}},
+       {{"ret"}, "Mul", {"i", "i"}, {{"T", DT_FLOAT}}}},
+      /*ret_def=*/{{"o", "ret:z:0"}},
+      /*control_ret_def=*/{{"must_execute", "add"}});
+
+  ConfigProto config_pb;
+  config_pb.mutable_device_count()->insert({"CPU", 1});
+  config_pb.mutable_device_count()->insert({"GPU", 1});
+  config_pb.set_allow_soft_placement(true);
+  for (int i = 0; i < 99; ++i) {
+    // Get the name fo the previous function
+    NameAttrList func;
+    func.set_name(fd->signature().name());
+
+    FunctionDef* fd = fl->add_function();
+    *fd = FunctionDefHelper::Create(
+        /*function_name=*/absl::StrCat("F_", i),
+        /*in_def=*/{"i: float"},
+        /*out_def=*/{"o: float"},
+        /*attr_def=*/{},
+        /*node_def=*/
+        {
+            {
+                {"inner_call"},
+                "PartitionedCall",
+                {"i"},
+                {{"Ti", DT_FLOAT},
+                 {"Tout", DT_FLOAT},
+                 {"config", ""},
+                 {"config_proto", config_pb.SerializeAsString()},
+                 {"f", func}},
+            },
+        },
+        /*ret_def=*/{{"o", "inner_call:o:0"}},
+        /*control_ret_def=*/{{"must_execute", "inner_call"}});
+  }
+
+  NodeDef* input = graph_def.add_node();
+  input->set_name("InputPlaceholder");
+  input->set_op("Placeholder");
+  AddNodeAttr("dtype", DT_FLOAT, input);
+
+  // Create call to the outer most function.
+  NodeDef* node = graph_def.add_node();
+  node->set_name("PartitionedCall_start");
+  node->set_op("PartitionedCall");
+  *node->add_input() = input->name();
+  AddNodeAttr("Tin", DT_FLOAT, node);
+  AddNodeAttr("Tout", DT_FLOAT, node);
+  AddNodeAttr("config", "", node);
+  AddNodeAttr("config_proto", config_pb.SerializeAsString(), node);
+  NameAttrList func;
+  func.set_name(fd->signature().name());
+  AddNodeAttr("f", func, node);
+
+  const NodeDef& target = graph_def.node(graph_def.node_size() - 1);
+
+  uint64_t hash_value;
+  for (auto _ : state) {
+    TF_CHECK_OK(HashNode(graph_def, target, &hash_value));
+  }
+}
+BENCHMARK(BM_ComposedFunctionCallsGraph);
 
 }  // namespace
 }  // namespace data

@@ -17,13 +17,13 @@ if(TARGET xnnpack OR xnnpack_POPULATED)
   return()
 endif()
 
-include(FetchContent)
+include(OverridableFetchContent)
 
 OverridableFetchContent_Declare(
   xnnpack
   GIT_REPOSITORY https://github.com/google/XNNPACK
   # Sync with tensorflow/workspace2.bzl
-  GIT_TAG 8c96521d55877cf971fc9318603798d923e0059a
+  GIT_TAG 8bf8d33a7285af155dd52ba7e280b63980c32472
   GIT_PROGRESS TRUE
   PREFIX "${CMAKE_BINARY_DIR}"
   SOURCE_DIR "${CMAKE_BINARY_DIR}/xnnpack"
@@ -40,16 +40,15 @@ set(XNNPACK_BUILD_BENCHMARKS OFF CACHE BOOL "Disable XNNPACK benchmarks.")
 
 # The following line adds project of PTHREADPOOL, FP16 and XNNPACK which are
 # needed to compile XNNPACK delegate of TFLite.
-add_subdirectory(
-  "${xnnpack_SOURCE_DIR}"
-  "${xnnpack_BINARY_DIR}"
-  EXCLUDE_FROM_ALL
-)
+# Note, we introduce an intermediate subdirectory, see ${TFLITE_SOURCE_DIR}/tools/cmake/modules/xnnpack/CMakeLists.txt
+# for details.
+add_subdirectory(${TFLITE_SOURCE_DIR}/tools/cmake/modules/xnnpack)
 
 include_directories(
   AFTER
    "${PTHREADPOOL_SOURCE_DIR}/include"
    "${FP16_SOURCE_DIR}/include"
    "${XNNPACK_SOURCE_DIR}/include"
+   "${XNNPACK_SOURCE_DIR}"
    "${CPUINFO_SOURCE_DIR}/"
 )
